@@ -1620,6 +1620,21 @@ with tab_export:
         "tie_b": tie_b_exp,
         "tie_h": tie_h_exp,
         "shell_section_prefix": "ZAP_",
+        "project_info": {
+            "Company Name": "SmartCouplers MG SAS",
+            "Client Name": "Sin Nombre",
+            "Project Name": "Sin Nombre",
+            "Project Number": "001",
+            "Model Name": uploaded.name.rsplit(".", 1)[0] + "_CIMENTACION",
+            "Model Description": "Modelo creado a partir de una aplicacion web creada con IA",
+            "Revision Number": "001",
+            "Frame Type": "Sistema de Cimentaciones Superficiales",
+            "Engineer": "Creado Por - Sergio Medina",
+            "Checker": "Definir Nombre de Revisor",
+            "Supervisor": "Definir Nombre de Supervisor",
+            "Issue Code": "Version 01",
+            "Design Code": "Version 01",
+        }
     }
 
     sx1, sx2 = st.columns(2)

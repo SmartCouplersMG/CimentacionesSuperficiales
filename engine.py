@@ -133,6 +133,8 @@ def build_jloads_from_sap_reactions_excel(df, foundation_entities):
     # Filtrar solo joints válidos
     df2 = df2[df2["Joint"].isin(valid_joints)]
 
+    sign = -1.0
+
     for jid in sorted(df2["Joint"].unique()):
         sub = df2[df2["Joint"] == jid]
         out[jid] = {}
@@ -149,12 +151,12 @@ def build_jloads_from_sap_reactions_excel(df, foundation_entities):
                 row = rows.iloc[0]
 
             out[jid][case] = {
-                "F1": float(row["F1"]),
-                "F2": float(row["F2"]),
-                "F3": float(row["F3"]),
-                "M1": float(row["M1"]),
-                "M2": float(row["M2"]),
-                "M3": float(row["M3"]),
+                "F1": sign * float(row["F1"]),
+                "F2": sign * float(row["F2"]),
+                "F3": sign * float(row["F3"]),
+                "M1": sign * float(row["M1"]),
+                "M2": sign * float(row["M2"]),
+                "M3": sign * float(row["M3"]),
             }
 
     return out

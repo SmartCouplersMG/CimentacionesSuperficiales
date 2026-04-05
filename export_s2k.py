@@ -140,6 +140,31 @@ def _area_shell_row(section_name, material, thickness, color="DarkCyan"):
 def _build_concrete_material_name(fc_mpa: float) -> str:
     return f"CONC_{int(round(fc_mpa))}MPa"
 
+def _project_info_rows(project_info=None, model_name="CIMENTACION_EXPORTADA"):
+    project_info = project_info or {}
+
+    defaults = {
+        "Company Name": "SmartCouplers MG SAS",
+        "Client Name": "No Client",
+        "Project Name": "Sin Nombre",
+        "Project Number": "001",
+        "Model Name": model_name,
+        "Model Description": "Modelo creado a partir de una aplicacion web creada con IA",
+        "Revision Number": "001",
+        "Frame Type": "Sistema de Cimentaciones Superficiales",
+        "Engineer": "Definir Nombre de Diseñador",
+        "Checker": "Definir Nombre de Revisor",
+        "Supervisor": "Definir Nombre de Supervisor",
+        "Issue Code": "Version 01",
+        "Design Code": "Version 01",
+    }
+
+    defaults.update(project_info)
+
+    rows = []
+    for item, data in defaults.items():
+        rows.append(_line(Item=f'"{item}"', Data=f'"{data}"'))
+    return rows
 
 def export_foundation_s2k(model_data, results, params, export_cfg=None):
     export_cfg = export_cfg or {}
@@ -153,6 +178,7 @@ def export_foundation_s2k(model_data, results, params, export_cfg=None):
 
     units = export_cfg.get("units", "KN, m, C")
     model_name = export_cfg.get("model_name", "CIMENTACION_EXPORTADA")
+    project_info = export_cfg.get("project_info", {})
     pedestal_h = float(export_cfg.get("pedestal_h", 0.50))
     z_top = float(export_cfg.get("z_top", 0.0))
     footing_z = z_top - pedestal_h
@@ -197,6 +223,12 @@ def export_foundation_s2k(model_data, results, params, export_cfg=None):
                 ConcSCode="Eurocode 2-2004",
                 RegenHinge="Yes"
             )
+        )
+        # --------------------------------------------------------
+        # PROJECT INFORMATION
+        # --------------------------------------------------------
+        out["PROJECT INFORMATION"].extend(
+            _project_info_rows(project_info=project_info, model_name=model_name)
         )
 
     # Copy all non-concrete material tables
@@ -565,6 +597,7 @@ def export_foundation_s2k(model_data, results, params, export_cfg=None):
 
     ordered_names = [
         "PROGRAM CONTROL",
+        "PROJECT INFORMATION",
         "MATERIAL PROPERTIES 01 - GENERAL",
         "MATERIAL PROPERTIES 02 - BASIC MECHANICAL PROPERTIES",
         "MATERIAL PROPERTIES 03A - STEEL DATA",
