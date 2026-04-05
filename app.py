@@ -11,6 +11,7 @@ import streamlit as st
 import plotly.graph_objects as go
 import pandas as pd
 import json, math, tempfile, os, io
+import base64
 from engine import (
     read_model,
     resolve_basis_selection,
@@ -21,7 +22,11 @@ from engine import (
 )
 from export_s2k import export_foundation_s2k
 
-st.set_page_config(page_title="Cimentaciones", page_icon="🏗️", layout="wide")
+st.set_page_config(
+    page_title="Cimentaciones",
+    page_icon="assets/logo2.png",
+    layout="wide"
+)
 
 # ════════════════════════════════════════════════
 # HELPERS
@@ -171,6 +176,21 @@ def table_to_ties_dict(tie_rows, columns):
 # SIDEBAR
 # ════════════════════════════════════════════════
 with st.sidebar:
+    # 🔹 Logo con altura controlada
+    st.image("assets/logo.png", use_container_width=True)  # ajusta el ancho aquí
+
+    # 🔹 Texto pegado al logo
+    st.markdown(
+        """
+        <div style='font-size:11px; color:#6b7280; text-align:center; margin-top:-100px; line-height:1.2;'>
+        Aplicación desarrollada con fines didácticos por<br>
+        SmartCouplers MG SAS.<br>
+        No está auditada ni validada.<br>
+        NO USAR PARA FINES PROFESIONALES!<br>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
     st.title("⚙️ Parámetros")
     R = st.number_input("R", value=7.0, step=0.5)
     fc = st.number_input("f'c (MPa)", value=21.0, step=1.0)
@@ -212,7 +232,18 @@ with st.sidebar:
 # ════════════════════════════════════════════════
 # MAIN — CARGA DE ARCHIVO
 # ════════════════════════════════════════════════
-st.title("🏗️ Diseño de cimentaciones superficiales")
+
+st.markdown(
+    """
+    <div style='text-align: center;'>
+        <img src="data:image/png;base64,{}" width="180">
+        <h1 style='margin-top: -30px;'>Diseño de cimentaciones superficiales</h1>
+    </div>
+    """.format(
+        base64.b64encode(open("assets/logo2.png", "rb").read()).decode()
+    ),
+    unsafe_allow_html=True
+)
 
 uploaded = st.file_uploader("Subir archivo .$2k", type=None)
 if uploaded is None:
