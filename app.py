@@ -1679,8 +1679,11 @@ with tab_export:
             import openpyxl
             from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
             from openpyxl.utils import get_column_letter
+            from openpyxl.drawing.image import Image as XLImage
         except ImportError:
             st.error("pip install openpyxl"); st.stop()
+        import os as _os
+        from datetime import datetime as _dt
 
         wb = openpyxl.Workbook()
         hf = Font(bold=True, color='FFFFFF', size=10)
@@ -1697,8 +1700,239 @@ with tab_export:
                 cell.font = hf; cell.fill = hfill
                 cell.alignment = Alignment(horizontal='center'); cell.border = bd
 
-        # 1. Resumen
-        ws = wb.active; ws.title = "Resumen"
+        # ── 0. PORTADA ──
+        ws0 = wb.active; ws0.title = "Portada"
+
+        # Anchos de columna: A(margen) B(nombre hoja) C-D(descripción) E-H(variables) I(margen)
+        for ci, cw in zip(range(1, 10), [2, 16, 16, 16, 16, 16, 16, 16, 2]):
+            ws0.column_dimensions[get_column_letter(ci)].width = cw
+
+        # --- Logo: crop 25% superior e inferior → zona central 50% → display 4"×2" ---
+        _logo_path = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), 'assets', 'logo.png')
+        if _os.path.exists(_logo_path):
+            try:
+                from PIL import Image as _PILImg
+                _pil = _PILImg.open(_logo_path)
+                _pw_orig, _ph_orig = _pil.size
+                _pil_crop = _pil.crop((0, _ph_orig // 4, _pw_orig, 3 * _ph_orig // 4))
+                _logo_buf = io.BytesIO()
+                _pil_crop.save(_logo_buf, format='PNG')
+                _logo_buf.seek(0)
+                _img = XLImage(_logo_buf)
+            except Exception:
+                _img = XLImage(_logo_path)
+            _img.width = 384   # 4" a 96 dpi
+            _img.height = 192  # 2" a 96 dpi
+            ws0.add_image(_img, 'B2')
+        for _r in range(2, 6):
+            ws0.row_dimensions[_r].height = 28   # 4 filas × 28pt
+        ws0.row_dimensions[6].height = 14
+
+        # --- Título (a la derecha del logo) ---
+        ws0.merge_cells('E2:H5')
+        _c = ws0['E2']
+        _c.value = "DISEÑO DE CIMENTACIONES SUPERFICIALES"
+        _c.font = Font(bold=True, size=28, color='1E3A5F')
+        _c.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+
+        ws0.merge_cells('E6:H6')
+        ws0.row_dimensions[6].height = 14
+        _c = ws0['E6']
+        _c.value = f"Informe generado: {_dt.now().strftime('%d/%m/%Y  %H:%M')}"
+        _c.font = Font(size=9, color='888888')
+        _c.alignment = Alignment(horizontal='right', vertical='center')
+
+        # --- Separador azul ---
+        ws0.row_dimensions[7].height = 5
+        for _ci in range(2, 9):
+            ws0.cell(row=7, column=_ci).fill = PatternFill(start_color='2563EB', end_color='2563EB', fill_type='solid')
+
+        # helper: escribe + fusiona B:H en una fila
+        def _pw(row, value, font_kw=None, fill_color=None, h=16, wrap=False, align='left'):
+            ws0.merge_cells(start_row=row, end_row=row, start_column=2, end_column=8)
+            ws0.row_dimensions[row].height = h
+            _cell = ws0.cell(row=row, column=2, value=value)
+            _cell.font = Font(**(font_kw or {}))
+            if fill_color:
+                _cell.fill = PatternFill(start_color=fill_color, end_color=fill_color, fill_type='solid')
+            _cell.alignment = Alignment(horizontal=align, vertical='center', wrap_text=wrap)
+            return _cell
+
+        _r = 8   # spacer
+        ws0.row_dimensions[_r].height = 6
+
+        # ── SMART COUPLERS MG ──
+        _r = 9
+        _pw(_r, "  SMART COUPLERS MG",
+            font_kw=dict(bold=True, size=11, color='FFFFFF'), fill_color='1E3A5F', h=20)
+        for _sc_line in [
+            ("Smart Couplers MG es una empresa colombiana dedicada a la implementación de métodos y técnicas "
+             "industrializadas en la construcción de estructuras, principalmente de concreto reforzado."),
+            ("Distribuimos y asesoramos en la implementación de empalmes mecánicos en sus proyectos. "
+             "Esta aplicación fue desarrollada como parte de nuestras iniciativas de innovación tecnológica."),
+            ("Sitio web: www.scmgsas.com   |   Tel: +57 323 2849503   |   gerencia@scmgsas.com"),
+        ]:
+            _r += 1
+            _is_contact = _sc_line.startswith("Sitio web")
+            _pw(_r, _sc_line,
+                font_kw=dict(size=10, bold=_is_contact, color='1E3A5F' if _is_contact else '1F2937'),
+                fill_color='EFF6FF', h=30, wrap=True)
+
+        # ── DESCRIPCIÓN ──
+        _r += 2
+        _pw(_r, "  DESCRIPCIÓN DE LA APLICACIÓN",
+            font_kw=dict(bold=True, size=11, color='FFFFFF'), fill_color='2563EB', h=20)
+
+        _desc_lines = [
+            "Esta herramienta realiza el predimensionamiento y diseño de cimentaciones superficiales aisladas y combinadas.",
+            "Procesa modelos estructurales, clasifica zapatas según su ubicación (concéntrica, medianera, esquinera),",
+            "dimensiona geométricamente por presiones admisibles (ASD) y verifica el diseño por resistencia última (LRFD-ACI 318).",
+            "Incluye diseño de vigas de cimentación (sistemas de enlace) con análisis de momentos, cortantes y refuerzo.",
+            "Desarrollada con el modelo de Inteligencia Artificial  Claude Opus 4.6  de Anthropic.",
+        ]
+        for _i, _line in enumerate(_desc_lines):
+            _r += 1
+            _is_ai = _line.startswith("Desarrollada")
+            _pw(_r, _line,
+                font_kw=dict(size=10, bold=_is_ai),
+                fill_color='EFF6FF' if _is_ai else 'F9FAFB',
+                h=16, wrap=True)
+
+        # ── BASE TEÓRICA ──
+        _r += 2
+        _pw(_r, "  BASE TEÓRICA",
+            font_kw=dict(bold=True, size=11, color='FFFFFF'), fill_color='2563EB', h=20)
+        for _book in [
+            "• Bowles, J.E. — Foundation Analysis and Design, 5th Ed. — McGraw-Hill",
+            "• McCormac, J.C. — Diseño de Concreto Reforzado, 8th Ed. — Alfaomega / Wiley",
+        ]:
+            _r += 1
+            _pw(_r, _book, font_kw=dict(size=10, italic=True), fill_color='F9FAFB', h=16)
+
+        # ── ADVERTENCIAS ──
+        _r += 2
+        _pw(_r, "  ⚠   ADVERTENCIAS IMPORTANTES — LEER ANTES DE USAR",
+            font_kw=dict(bold=True, size=11, color='FFFFFF'), fill_color='B91C1C', h=22)
+
+        _warnings = [
+            ("Esta aplicación NO ha sido auditada ni probada exhaustivamente. Sus resultados pueden contener errores "
+             "no detectados. SIEMPRE verifique los resultados con un ingeniero estructural calificado antes de "
+             "cualquier uso.", True),
+            ("La herramienta fue generada con Inteligencia Artificial (IA). Los modelos de IA pueden producir "
+             "resultados plausibles pero incorrectos (fenómeno conocido como 'alucinaciones'). No se garantiza "
+             "la exactitud, completitud ni consistencia de ningún cálculo.", True),
+            ("La IA que generó esta aplicación no posee licencia de ingeniería ni asume responsabilidad "
+             "profesional. No puede reemplazar el criterio y la responsabilidad de un profesional habilitado.", False),
+            ("USO EXCLUSIVAMENTE DIDÁCTICO Y EDUCATIVO. Esta aplicación NO es válida para uso profesional, "
+             "proyectos de construcción reales, trámites de permiso ni toma de decisiones estructurales.", True),
+            ("El uso de esta herramienta con fines profesionales o en proyectos reales queda bajo la entera "
+             "responsabilidad del usuario. Los autores no asumen ninguna responsabilidad por daños derivados.", False),
+        ]
+        for _warn, _crit in _warnings:
+            _r += 1
+            _pw(_r, _warn,
+                font_kw=dict(size=10, bold=_crit, color='7F1D1D' if _crit else '1F2937'),
+                fill_color='FEE2E2' if _crit else 'FEF3C7',
+                h=36, wrap=True)
+
+        # ── CONTENIDO DEL INFORME ──
+        _r += 2
+        _pw(_r, "  CONTENIDO DEL INFORME — GUÍA DE HOJAS",
+            font_kw=dict(bold=True, size=11, color='FFFFFF'), fill_color='2563EB', h=20)
+
+        # Encabezados de la tabla guía
+        _r += 1
+        ws0.row_dimensions[_r].height = 18
+        for _sc, _ec, _htitle in [(2, 2, "Hoja"), (3, 4, "Descripción"), (5, 8, "Variables principales")]:
+            ws0.merge_cells(start_row=_r, end_row=_r, start_column=_sc, end_column=_ec)
+            _c = ws0.cell(row=_r, column=_sc, value=_htitle)
+            _c.font = Font(bold=True, size=10, color='FFFFFF')
+            _c.fill = PatternFill(start_color='374151', end_color='374151', fill_type='solid')
+            _c.alignment = Alignment(horizontal='center', vertical='center')
+            _c.border = bd
+
+        _sheet_guide = [
+            ("Resumen",
+             "Dimensiones finales de cada zapata y resumen ejecutivo de diseño.",
+             "ID — identificador; Tipo — simple/combined; Esquema — tipo de zapata; "
+             "Loc — ubicación (concéntrica, medianera, esquinera); B × L × h — dimensiones (m); "
+             "Área (m²); Vol (m³); qmax / qmin — presiones extremas del suelo (kPa); "
+             "FSv — factor de seguridad al volcamiento; FSd — factor de seguridad al deslizamiento; "
+             "Pu — carga axial última (kN); P% — ratio punzonamiento (%); V% — ratio corte (%); "
+             "Asx / Asy — acero requerido por dirección (cm²); Ref X / Ref Y — varilla propuesta; "
+             "Estado — resultado del diseño (OK, REVISION, NO_CUMPLE)"),
+            ("ASD",
+             "Verificación por presiones admisibles del suelo (Allowable Stress Design). "
+             "Una fila por combinación de carga por cada zapata.",
+             "Combo — nombre de la combinación de carga; Grupo q1/q2/q3 — tipo de carga "
+             "(permanente, temporal, sísmica); qadm — presión admisible del suelo (kPa); "
+             "P+Wp — carga vertical total incluyendo peso de zapata (kN); "
+             "Mx / My — momentos en la base de la zapata (kN·m); "
+             "Vx / Vy — cortantes horizontales (kN); ex / ey — excentricidades resultantes (m); "
+             "Contacto — estado de contacto suelo-zapata (full / parcial); "
+             "q1, q2, q3, q4 — presiones en las cuatro esquinas (kPa); "
+             "qmax / qmin — presión máxima y mínima (kPa); "
+             "Ratio = qmax / qadm (verde ≤ 0.85 | amarillo ≤ 1.05 | rojo > 1.05); "
+             "FSv — factor de seguridad al volcamiento; FSd — factor de seguridad al deslizamiento"),
+            ("LRFD",
+             "Diseño por resistencia última (Load & Resistance Factor Design — ACI 318). "
+             "Una fila por combinación de carga por cada zapata.",
+             "Combo — combinación de carga última; Pu — carga axial última (kN); "
+             "Mux / Muy — momentos últimos por dirección (kN·m); "
+             "vu_max — tensión de corte unitaria máxima (kPa); "
+             "φvc — resistencia del concreto a corte reducida por φ (kN); "
+             "P% — relación de demanda / capacidad a punzonamiento (%); "
+             "Vu_x / Vu_y — cortante último por dirección (kN); "
+             "φVn_x / φVn_y — resistencia nominal reducida a corte por dirección (kN); "
+             "Vx% / Vy% — ratios de corte por dirección (%); Vmax% — ratio de corte máximo (%); "
+             "Mu_x / Mu_y — momentos de diseño a flexión (kN·m); "
+             "As_x / As_y — acero de refuerzo requerido por dirección (cm²)"),
+            ("Cantidades",
+             "Metrado de materiales de la cimentación (material take-off). "
+             "Una fila por zapata.",
+             "ID — identificador de zapata; Tipo — simple / combined; "
+             "B, L, h — dimensiones de la zapata (m); "
+             "Vol(m³) — volumen de concreto de la zapata; "
+             "Concreto(kN) — peso propio del concreto (γc × Vol); "
+             "Asx / Asy — área de acero de refuerzo requerida por dirección (cm²); "
+             "Ref X / Ref Y — especificación de varilla propuesta (cantidad × diámetro)"),
+            ("Sistemas\nEnlace",
+             "Diseño de vigas de cimentación que conectan las zapatas entre sí. "
+             "Una fila por sistema de enlace.",
+             "Sistema — identificador del sistema (S01, S02...); Dir — dirección X o Y; "
+             "Zapatas — IDs de zapatas conectadas; Nodos — cantidad de apoyos del sistema; "
+             "L total(m) — longitud total de la viga de enlace; "
+             "Mu+(kNm) — momento flector positivo máximo (zona de tracción inferior); "
+             "Mu-(kNm) — momento flector negativo máximo (zona de tracción superior); "
+             "Vu(kN) — cortante máximo; b × h (cm) — sección transversal de la viga; "
+             "As inf(cm²) — acero longitudinal inferior; Ref inf — varilla inferior propuesta; "
+             "As sup(cm²) — acero longitudinal superior; Ref sup — varilla superior propuesta; "
+             "V% — ratio de demanda / capacidad a cortante (%); "
+             "s_est(cm) — espaciado de estribos; Estado — ok / REVISAR_SECCION"),
+        ]
+        for _sname, _sdesc, _svars in _sheet_guide:
+            _r += 1
+            ws0.row_dimensions[_r].height = 65
+            # Columna nombre hoja
+            ws0.cell(row=_r, column=2, value=_sname).font = Font(bold=True, size=10, color='1E3A5F')
+            ws0.cell(row=_r, column=2).fill = PatternFill(start_color='DBEAFE', end_color='DBEAFE', fill_type='solid')
+            ws0.cell(row=_r, column=2).alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+            ws0.cell(row=_r, column=2).border = bd
+            # Columna descripción (C:D fusionadas)
+            ws0.merge_cells(start_row=_r, end_row=_r, start_column=3, end_column=4)
+            _c = ws0.cell(row=_r, column=3, value=_sdesc)
+            _c.font = Font(size=9); _c.border = bd
+            _c.fill = PatternFill(start_color='F9FAFB', end_color='F9FAFB', fill_type='solid')
+            _c.alignment = Alignment(horizontal='left', vertical='center', wrap_text=True)
+            # Columna variables (E:H fusionadas)
+            ws0.merge_cells(start_row=_r, end_row=_r, start_column=5, end_column=8)
+            _c = ws0.cell(row=_r, column=5, value=_svars)
+            _c.font = Font(size=8); _c.border = bd
+            _c.fill = PatternFill(start_color='F9FAFB', end_color='F9FAFB', fill_type='solid')
+            _c.alignment = Alignment(horizontal='left', vertical='top', wrap_text=True)
+
+        # ── 1. Resumen ──
+        ws = wb.create_sheet("Resumen")
         ws['A1'] = "PREDIMENSIONAMIENTO DE CIMENTACIONES"; ws['A1'].font = Font(bold=True, size=14)
         ws['A2'] = f"R={R} | f'c={fc}MPa | qadm: {qadm_1}/{qadm_2}/{qadm_3} kPa"
         headers = ['ID', 'Tipo', 'Esquema', 'Loc', 'B', 'L', 'h', 'Área', 'Vol',
