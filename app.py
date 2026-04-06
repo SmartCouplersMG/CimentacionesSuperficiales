@@ -16,11 +16,10 @@ from engine import (
     read_model,
     resolve_basis_selection,
     run_design,
-    deduce_tie_beams,
-    propose_rebar,
-    infer_column_axis,
     normalize_reactions_df,
 )
+from isolated import propose_rebar, infer_column_axis
+from tie_system import deduce_tie_beams
 from parser import auto_classify_patterns, classify_from_user
 from export_s2k import export_foundation_s2k
 # from export_e2k import export_foundation_e2k  # temporalmente suspendido

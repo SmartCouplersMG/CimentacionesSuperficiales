@@ -1924,16 +1924,21 @@ def run_design(model_data, classifications, params, user_ties=None, user_dims=No
             for pat, ld in jloads_design.get(jid, {}).items()
         }
 
+        # x / y = centro REAL de la zapata (desplazado para medianera/esquinera).
+        # x_col / y_col = posición de la columna en el modelo.
+        # rect se construye desde el centro de la zapata para que check_overlaps sea correcto.
+        _zx = opt["x_footing"]
+        _zy = opt["y_footing"]
         f = {
             "id": f"Z-{idx:02d}",
             "type": "isolated",
             "joint": jid,
-            "x": opt["x_footing"],
-            "y": opt["y_footing"],
+            "x": _zx,
+            "y": _zy,
             "x_col": opt["x_col"],
             "y_col": opt["y_col"],
-            "x_footing": opt["x_footing"],
-            "y_footing": opt["y_footing"],
+            "x_footing": _zx,
+            "y_footing": _zy,
             "e_geo_x": opt.get("e_geo_x", 0),
             "e_geo_y": opt.get("e_geo_y", 0),
             "B": opt["B"],
@@ -1942,10 +1947,10 @@ def run_design(model_data, classifications, params, user_ties=None, user_dims=No
             "A": round(opt["B"] * opt["L"], 2),
             "vol": opt["vol"],
             "rect": [
-                opt["x_footing"] - opt["B"] / 2,
-                opt["y_footing"] - opt["L"] / 2,
-                opt["x_footing"] + opt["B"] / 2,
-                opt["y_footing"] + opt["L"] / 2,
+                _zx - opt["B"] / 2,
+                _zy - opt["L"] / 2,
+                _zx + opt["B"] / 2,
+                _zy + opt["L"] / 2,
             ],
             "cols": [col],
             "col_bx": col["bx"],
@@ -1967,7 +1972,10 @@ def run_design(model_data, classifications, params, user_ties=None, user_dims=No
     footings_nonwall = [f for f in footings if not f.get("is_wall_equivalent", False)]
     footings_wall = [f for f in footings if f.get("is_wall_equivalent", False)]
 
-    ovs, groups_nonwall = check_overlaps(footings_nonwall, min_gap=0.10)
+    # min_gap=0.02: sólo agrupa zapatas que se solapan realmente (< 1cm borde a borde).
+    # Antes era 0.10, lo que agrupaba zapatas a < 5cm de distancia (falsos positivos
+    # para medianera/esquinera desplazadas respecto a concéntricas vecinas).
+    ovs, groups_nonwall = check_overlaps(footings_nonwall, min_gap=0.02)
 
     # Los muros siempre se tratan como aisladas independientes
     groups_wall = [[i] for i in range(len(footings_wall))]
@@ -1994,8 +2002,11 @@ def run_design(model_data, classifications, params, user_ties=None, user_dims=No
         if len(grp) == 1:
             # ── Zapata aislada → diseño estructural completo ──
             f = footings[grp[0]]
+            # Pasar siempre el CENTRO DE LA ZAPATA (no el de la columna)
+            _fx = f.get("x_footing", f["x"])
+            _fy = f.get("y_footing", f["y"])
             r = full_structural_design(
-                f["joint"], f["x"], f["y"], f["B"], f["L"], f["h"],
+                f["joint"], _fx, _fy, f["B"], f["L"], f["h"],
                 f["col_bx"], f["col_by"],
                 ads_all.get(f["joint"], {}), lrfd_all.get(f["joint"], {}),
                 params, f["column_forces"]
@@ -2010,10 +2021,12 @@ def run_design(model_data, classifications, params, user_ties=None, user_dims=No
             r["scheme"] = f.get("ties", {}).get("scheme_suggested", "aislada")
             r["x_col"] = f.get("x_col", f["x"])
             r["y_col"] = f.get("y_col", f["y"])
-            r["x_footing"] = f.get("x_footing", f["x"])
-            r["y_footing"] = f.get("y_footing", f["y"])
-            r["e_geo_x"] = f.get("e_geo_x", round(abs(f.get("x_col", f["x"]) - f["x"]), 4))
-            r["e_geo_y"] = f.get("e_geo_y", round(abs(f.get("y_col", f["y"]) - f["y"]), 4))
+            r["x_footing"] = _fx
+            r["y_footing"] = _fy
+            r["e_geo_x"] = f.get("e_geo_x", round(abs(f.get("x_col", f["x"]) - _fx), 4))
+            r["e_geo_y"] = f.get("e_geo_y", round(abs(f.get("y_col", f["y"]) - _fy), 4))
+            # rect: bounding box desde centro real de zapata (para plots y export)
+            r["rect"] = [_fx - f["B"]/2, _fy - f["L"]/2, _fx + f["B"]/2, _fy + f["L"]/2]
             final.append(r)
         else:
             # ── Zapata combinada → módulo combined ──
