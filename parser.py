@@ -1212,3 +1212,358 @@ def compute_forces(jloads, combos):
             }
 
     return R
+
+
+# ================================================================
+# DETECTOR DE FORMATO + PARSER ETABS .e2k / .$et
+# ================================================================
+
+def detect_file_format(fp):
+    """
+    Detecta si el archivo es formato ETABS (.e2k / .$et) o SAP2000 (.$2k).
+    Retorna: 'etabs' | 'sap2000' | 'unknown'
+    """
+    with open(fp, 'r', encoding='utf-8', errors='replace') as f:
+        header = f.read(3000)
+    if 'PROGRAM "ETABS"' in header or 'PROGRAM  "ETABS"' in header:
+        return 'etabs'
+    if 'TABLE:' in header:
+        return 'sap2000'
+    return 'unknown'
+
+
+def parse_e2k(fp):
+    """
+    Parsea archivo ETABS .e2k / .$et y retorna dict T compatible con get_*().
+
+    El formato ETABS 2D usa secciones $ HEADER y coordenadas de planta (X, Y).
+    La coordenada Z se deduce del sistema de pisos (STORIES).
+    Solo se crean entidades a nivel de base (piso N+0.0).
+    """
+    with open(fp, 'r', encoding='utf-8', errors='replace') as f:
+        content = f.read()
+
+    # ── Parsear secciones por encabezados $ ──
+    secs = {}
+    cur = None
+    for line in content.split('\n'):
+        ls = line.strip()
+        if not ls:
+            continue
+        if ls.startswith('$'):
+            cur = ls[1:].strip()
+            secs.setdefault(cur, [])
+        elif cur is not None:
+            secs[cur].append(ls)
+
+    # ── Unidades: factor de longitud a metros ──
+    len_fac = 1.0
+    for ln in secs.get('CONTROLS', []):
+        m = re.match(r'UNITS\s+"[^"]*"\s+"([^"]+)"', ln, re.I)
+        if m:
+            if m.group(1).upper() == 'MM':
+                len_fac = 1e-3
+            break
+
+    # ── Pisos: obtener altura del primer piso sobre base ──
+    stories_raw = []
+    for ln in secs.get('STORIES - IN SEQUENCE FROM TOP', []):
+        m_n = re.search(r'STORY\s+"([^"]+)"', ln)
+        if not m_n:
+            continue
+        sname = m_n.group(1)
+        m_e = re.search(r'\bELEV\b\s+([\d.eE+-]+)', ln)
+        m_h = re.search(r'\bHEIGHT\b\s+([\d.eE+-]+)', ln)
+        elev = float(m_e.group(1)) * len_fac if m_e else None
+        height = float(m_h.group(1)) * len_fac if m_h else None
+        stories_raw.append({'name': sname, 'elev': elev, 'height': height})
+
+    # Piso base: tiene ELEV ~ 0
+    base_story_name = 'N+0.0'
+    for s in stories_raw:
+        if s['elev'] is not None and abs(s['elev']) < 1e-6:
+            base_story_name = s['name']
+            break
+
+    # Altura del primer piso sobre base (para joints sintéticos)
+    h_top = 3.0
+    base_idx = next((i for i, s in enumerate(stories_raw) if s['name'] == base_story_name), -1)
+    if base_idx > 0:
+        above = stories_raw[base_idx - 1]
+        if above['height'] is not None:
+            h_top = above['height']
+        elif above['elev'] is not None:
+            h_top = above['elev']
+    elif stories_raw:
+        for s in stories_raw:
+            if s.get('height') is not None:
+                h_top = s['height']
+                break
+
+    # ── Coordenadas de planta ──
+    plan_pts = {}  # id -> (x, y)
+    for ln in secs.get('POINT COORDINATES', []):
+        m = re.match(r'POINT\s+"([^"]+)"\s+([\d.eE+-]+)\s+([\d.eE+-]+)', ln)
+        if m:
+            plan_pts[m.group(1)] = (
+                float(m.group(2)) * len_fac,
+                float(m.group(3)) * len_fac,
+            )
+
+    # ── Nudos con restricción en el piso base ──
+    base_joints = set()
+    for ln in secs.get('POINT ASSIGNS', []):
+        m = re.match(r'POINTASSIGN\s+"([^"]+)"\s+"([^"]+)"\s+RESTRAINT', ln, re.I)
+        if m and m.group(2) == base_story_name:
+            base_joints.add(m.group(1))
+
+    # ── Conectividad de columnas (LINE … COLUMN) ──
+    col_plan_pt = {}  # col_id -> plan_point_id
+    for ln in secs.get('LINE CONNECTIVITIES', []):
+        m = re.match(r'LINE\s+"([^"]+)"\s+COLUMN\s+"([^"]+)"', ln, re.I)
+        if m:
+            col_plan_pt[m.group(1)] = m.group(2)
+
+    # ── Sección asignada a cada columna (LINE ASSIGNS) ──
+    col_section = {}  # col_id -> section_name (primer piso encima de base)
+    for ln in secs.get('LINE ASSIGNS', []):
+        m = re.match(r'LINEASSIGN\s+"([^"]+)"\s+"([^"]+)"\s+SECTION\s+"([^"]+)"', ln, re.I)
+        if m:
+            lid, story, sec = m.group(1), m.group(2), m.group(3)
+            if lid not in col_section and story != base_story_name:
+                col_section[lid] = sec
+
+    # ── Dimensiones de secciones de frame (FRAME SECTIONS) ──
+    fsec_dims = {}  # section_name -> {t3, t2}
+    for ln in secs.get('FRAME SECTIONS', []):
+        m_n = re.search(r'FRAMESECTION\s+"([^"]+)"', ln, re.I)
+        m_d = re.search(r'\bD\b\s+([\d.eE+-]+)', ln)
+        m_b = re.search(r'\bB\b\s+([\d.eE+-]+)', ln)
+        if m_n and m_d and m_b:
+            fsec_dims[m_n.group(1)] = {
+                't3': float(m_d.group(1)) * len_fac,
+                't2': float(m_b.group(1)) * len_fac,
+            }
+
+    # ── Conectividad de áreas (muros) ──
+    area_joints = {}  # area_id -> [j1, j2] (plan points únicos)
+    for ln in secs.get('AREA CONNECTIVITIES', []):
+        m_id = re.match(r'AREA\s+"([^"]+)"', ln, re.I)
+        if not m_id:
+            continue
+        aid = m_id.group(1)
+        pts = re.findall(r'"([^"]+)"', ln)
+        # pts[0] = area_id, resto = joint IDs
+        if len(pts) > 1:
+            seen_jids = []
+            for jid in pts[1:]:
+                if jid not in seen_jids:
+                    seen_jids.append(jid)
+            area_joints[aid] = seen_jids
+
+    # ── Sección asignada a cada área (AREA ASSIGNS) ──
+    area_section = {}  # area_id -> section_name
+    for ln in secs.get('AREA ASSIGNS', []):
+        m = re.match(r'AREAASSIGN\s+"([^"]+)"\s+"([^"]+)"\s+SECTION\s+"([^"]+)"', ln, re.I)
+        if m:
+            aid = m.group(1)
+            if aid not in area_section:
+                area_section[aid] = m.group(3)
+
+    # ── Espesores de propiedades de muro (SHELLPROP) ──
+    wall_thickness = {}  # section_name -> thickness (m)
+    for sec_key in ('WALL PROPERTIES', 'SLAB PROPERTIES', 'DECK PROPERTIES'):
+        for ln in secs.get(sec_key, []):
+            m_n = re.search(r'SHELLPROP\s+"([^"]+)"', ln, re.I)
+            m_t = re.search(r'WALLTHICKNESS\s+([\d.eE+-]+)', ln, re.I)
+            if m_t is None:
+                m_t = re.search(r'SLABTHICKNESS\s+([\d.eE+-]+)', ln, re.I)
+            if m_n and m_t:
+                wall_thickness.setdefault(m_n.group(1), float(m_t.group(1)) * len_fac)
+
+    # ── Patrones de carga (LOAD PATTERNS) ──
+    lpats_raw = {}  # name -> type_str
+    for ln in secs.get('LOAD PATTERNS', []):
+        m_n = re.search(r'LOADPATTERN\s+"([^"]+)"', ln, re.I)
+        m_t = re.search(r'\bTYPE\b\s+"([^"]+)"', ln, re.I)
+        if m_n:
+            lpats_raw[m_n.group(1)] = m_t.group(1) if m_t else ''
+
+    # ══════════════════════════════════════════════
+    # Construir T dict compatible con get_*()
+    # ══════════════════════════════════════════════
+    T = {}
+
+    # JOINT COORDINATES: base (Z=0) + sintéticos arriba (Z=h_top)
+    jc_rows = []
+    for jid, (x, y) in plan_pts.items():
+        jc_rows.append(f'Joint="{jid}" XorR={x} Y={y} Z=0')
+        jc_rows.append(f'Joint="{jid}_t" XorR={x} Y={y} Z={h_top}')
+    T['JOINT COORDINATES'] = jc_rows
+
+    # FRAME SECTION PROPERTIES
+    fsp_rows = [
+        f'SectionName="{n}" t3={d["t3"]} t2={d["t2"]}'
+        for n, d in fsec_dims.items()
+    ]
+    T['FRAME SECTION PROPERTIES 01 - GENERAL'] = fsp_rows
+
+    # CONNECTIVITY - FRAME (solo columnas en base)
+    fc_rows, fs_rows = [], []
+    for col_id, pt_id in col_plan_pt.items():
+        if pt_id not in base_joints:
+            continue
+        sec = col_section.get(col_id, '')
+        fc_rows.append(f'Frame="{col_id}" JointI="{pt_id}" JointJ="{pt_id}_t"')
+        if sec:
+            fs_rows.append(f'Frame="{col_id}" AnalSect="{sec}"')
+    T['CONNECTIVITY - FRAME'] = fc_rows
+    T['FRAME SECTION ASSIGNMENTS'] = fs_rows
+
+    # JOINT RESTRAINT ASSIGNMENTS (nudos base)
+    T['JOINT RESTRAINT ASSIGNMENTS'] = [
+        f'Joint="{jid}" U1=Yes U2=Yes U3=Yes R1=Yes R2=Yes R3=Yes'
+        for jid in base_joints if jid in plan_pts
+    ]
+
+    # CONNECTIVITY - AREA (muros: base + top sintético)
+    ac_rows, as_rows = [], []
+    for aid, jpts in area_joints.items():
+        sec = area_section.get(aid, '')
+        if not sec or sec not in wall_thickness:
+            continue
+        if len(jpts) < 2:
+            continue
+        j1, j2 = jpts[0], jpts[1]
+        j_str = f'Joint1="{j1}" Joint2="{j2}" Joint3="{j2}_t" Joint4="{j1}_t"'
+        ac_rows.append(f'Area="{aid}" {j_str}')
+        as_rows.append(f'Area="{aid}" Section="{sec}"')
+    T['CONNECTIVITY - AREA'] = ac_rows
+    T['AREA SECTION ASSIGNMENTS'] = as_rows
+
+    # AREA SECTION PROPERTIES (espesores de muro)
+    T['AREA SECTION PROPERTIES'] = [
+        f'Section="{n}" Thickness={th}'
+        for n, th in wall_thickness.items()
+    ]
+
+    # LOAD PATTERN DEFINITIONS
+    T['LOAD PATTERN DEFINITIONS'] = [
+        f'LoadPat="{name}" DesignType="{etype}"'
+        for name, etype in lpats_raw.items()
+    ]
+
+    # Metadatos ETABS internos (no usan get_*() functions)
+    T['_etabs_meta'] = {
+        'base_story': base_story_name,
+        'h_top': h_top,
+        'len_fac': len_fac,
+        'lpats_raw': lpats_raw,
+    }
+
+    return T
+
+
+# ================================================================
+# CLASIFICACIÓN DE PATRONES: AUTO-DETECCIÓN + USUARIO
+# ================================================================
+
+def auto_classify_patterns(lpats):
+    """
+    Clasifica automáticamente los patrones de carga a partir de sus tipos.
+
+    lpats: {name: type_str}   — del parser SAP2000 o ETABS
+    Retorna {name: category_str}
+    category_str en: 'D', 'SD', 'L', 'Lr', 'Le',
+                     'Wx+', 'Wx-', 'Wy+', 'Wy-',
+                     'Sx', 'Sy', 'Ignorar'
+    """
+    result = {}
+    for name, type_str in lpats.items():
+        u_type = type_str.upper().strip()
+        u_name = name.upper()
+
+        if u_type in ('DEAD', 'DEAD LOAD'):
+            cat = 'D'
+        elif u_type in ('SUPER DEAD', 'SUPERDEAD', 'SDL', 'SUPERIMPOSED DEAD'):
+            cat = 'SD'
+        elif u_type in ('LIVE', 'LIVE LOAD', 'LIVE REDUCIBLE',
+                        'LIVE UNREDUCIBLE', 'LIVE STORAGE'):
+            cat = 'L'
+        elif u_type in ('ROOF LIVE', 'ROOF LIVE LOAD'):
+            cat = 'Lr'
+        elif u_type in ('LIVE PONDING',):
+            cat = 'Le'
+        elif u_type in ('SEISMIC (DRIFT)', 'SEISMIC DRIFT', 'WIND (DRIFT)'):
+            cat = 'Ignorar'
+        elif 'SEISMIC' in u_type or 'QUAKE' in u_type:
+            # Detectar dirección desde el nombre del patrón
+            # Busca X o Y como 2do carácter (ej: "Ex", "Sx") o como palabra sola
+            _pfx2 = u_name[:2] if len(u_name) >= 2 else u_name
+            _has_x = (
+                _pfx2 in ('EX', 'SX', 'QX')
+                or bool(re.search(r'(?<![A-Z])X(?![A-Z])', u_name))
+            )
+            _has_y = (
+                _pfx2 in ('EY', 'SY', 'QY')
+                or bool(re.search(r'(?<![A-Z])Y(?![A-Z])', u_name))
+            )
+            if _has_x and not _has_y:
+                cat = 'Sx'
+            elif _has_y and not _has_x:
+                cat = 'Sy'
+            else:
+                cat = 'Ignorar'
+        elif 'WIND' in u_type:
+            _pfx2 = u_name[:2] if len(u_name) >= 2 else u_name
+            has_x = _pfx2 in ('WX',) or bool(re.search(r'(?<![A-Z])X(?![A-Z])', u_name))
+            has_y = _pfx2 in ('WY',) or bool(re.search(r'(?<![A-Z])Y(?![A-Z])', u_name))
+            if '+' in name:
+                cat = 'Wx+' if (has_x or not has_y) else 'Wy+'
+            elif '-' in name:
+                cat = 'Wx-' if (has_x or not has_y) else 'Wy-'
+            else:
+                cat = 'Wx+' if (has_x or not has_y) else 'Wy+'
+        else:
+            # Intentar clasificar por nombre exacto (SAP2000 estándar)
+            _name_map = {
+                'D': 'D', 'SD': 'SD', 'L': 'L', 'LR': 'Lr', 'LR': 'Lr',
+                'LE': 'Le', 'WX+': 'Wx+', 'WX-': 'Wx-',
+                'WY+': 'Wy+', 'WY-': 'Wy-',
+                'SX': 'Sx', 'SY': 'Sy', 'EX': 'Sx', 'EY': 'Sy',
+            }
+            cat = _name_map.get(u_name, 'Ignorar')
+
+        result[name] = cat
+    return result
+
+
+def classify_from_user(user_assignment):
+    """
+    Convierte el dict de asignación del usuario a dict cl para gen_combos().
+
+    user_assignment: {pattern_name: category_str}
+    category_str: 'D', 'SD', 'L', 'Lr', 'Le',
+                  'Wx+', 'Wx-', 'Wy+', 'Wy-', 'Sx', 'Sy', 'Ignorar'
+    Retorna cl dict compatible con gen_combos().
+    """
+    cl = {
+        'dead': [], 'superdead': [], 'live': [],
+        'live_roof': [], 'live_eq': [],
+        'seismic_x': [], 'seismic_y': [],
+        'wind_xp': [], 'wind_xn': [],
+        'wind_yp': [], 'wind_yn': [],
+        'other': [],
+    }
+    _cat_map = {
+        'D': 'dead', 'SD': 'superdead', 'L': 'live',
+        'Lr': 'live_roof', 'Le': 'live_eq',
+        'Wx+': 'wind_xp', 'Wx-': 'wind_xn',
+        'Wy+': 'wind_yp', 'Wy-': 'wind_yn',
+        'Sx': 'seismic_x', 'Sy': 'seismic_y',
+        'Ignorar': 'other',
+    }
+    for pat, cat in user_assignment.items():
+        key = _cat_map.get(cat, 'other')
+        cl[key].append(pat)
+    return cl

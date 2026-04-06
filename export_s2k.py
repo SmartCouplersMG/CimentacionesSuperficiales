@@ -16,6 +16,7 @@ import uuid
 from collections import defaultdict
 
 from parser import gen_combos
+from export_utils import build_export_loads
 
 
 def _guid():
@@ -169,8 +170,10 @@ def _project_info_rows(project_info=None, model_name="CIMENTACION_EXPORTADA"):
 def export_foundation_s2k(model_data, results, params, export_cfg=None):
     export_cfg = export_cfg or {}
     tables_src = model_data["_tables"]
-    lp_src = model_data["_lp"]
-    jloads_src = model_data["_jloads"]
+
+    # ── Canonical load rename (D, SD, Sx, Sy … instead of original names) ──
+    export_lp, _rename_map, jloads_src, _renamed_cl, _combos_prebuilt = \
+        build_export_loads(model_data, params)
 
     final_footings = results["final_footings"]
     tie_systems = results.get("tie_systems", [])
@@ -268,11 +271,17 @@ def export_foundation_s2k(model_data, results, params, export_cfg=None):
         )
     )
 
-    # Load patterns and cases
-    _copy_table_if_exists(out, tables_src, "LOAD PATTERN DEFINITIONS")
+    # Load patterns and cases  (use canonical export names)
+    load_pat_rows = []
     load_case_rows = []
     static_assignments = []
-    for pat, des_type in lp_src.items():
+    for pat, des_type in export_lp.items():
+        load_pat_rows.append(
+            _line(LoadPat=f'"{pat}"', DesignType=f'"{des_type}"', SelfWtMult=0,
+                  AutoLoad="None")
+        )
+    out["LOAD PATTERN DEFINITIONS"].extend(load_pat_rows)
+    for pat, des_type in export_lp.items():
         load_case_rows.append(
             _line(
                 Case=f'"{pat}"', Type="LinStatic", InitialCond="Zero",
@@ -285,15 +294,16 @@ def export_foundation_s2k(model_data, results, params, export_cfg=None):
     out["LOAD CASE DEFINITIONS"].extend(load_case_rows)
     out["CASE - STATIC 1 - LOAD ASSIGNMENTS"].extend(static_assignments)
 
-    # Combos
-    cl = model_data["_cl"]
-    combos = gen_combos(cl, R=params["R"], ortho=True)
+    # Combos (use pre-built combos with canonical names)
+    combos = _combos_prebuilt
     ads_combo_names = []
     lrfd_combo_names = []
 
     def add_combo_block(combo_name, factors, combo_type="Linear Add"):
         first = True
         for case_name, sf in factors.items():
+            if case_name not in export_lp:   # skip cases not defined
+                continue
             row = {"ComboName": f'"{combo_name}"'}
             if first:
                 row.update({
@@ -526,7 +536,10 @@ def export_foundation_s2k(model_data, results, params, export_cfg=None):
             frame_assign.append(_line(Frame=fr, AutoSelect="N.A.", AnalSect=f'"{sec}"', MatProp="Default"))
 
             orig_joint = str(c["joint"])
+            # jloads_src is already renamed to canonical names by build_export_loads
             for pat, fv in jloads_src.get(orig_joint, {}).items():
+                if pat not in export_lp:   # safety: skip anything not defined
+                    continue
                 joint_load_rows.append(
                     _line(
                         Joint=j_top, LoadPat=f'"{pat}"', CoordSys="GLOBAL",

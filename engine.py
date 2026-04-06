@@ -51,6 +51,10 @@ from parser import (
     filter_wall_entities_by_joint_loads,
     filter_wall_entities_by_restraints,
     get_area_section_thicknesses,
+    detect_file_format,
+    parse_e2k,
+    auto_classify_patterns,
+    classify_from_user,
 )
 
 from isolated import (
@@ -377,6 +381,11 @@ def _build_model_return(
         # Set completos por fuente para futura selección manual
         "_supports_joint_loads": diag.get("usable_joint_candidates", {}),
         "_supports_restraints": diag.get("usable_restraint_candidates", {}),
+
+        # ── Formato y metadatos de archivo ──
+        "file_format": ("etabs" if isinstance(tables.get("_etabs_meta"), dict) else "sap2000"),
+        "_lpats_raw": (tables.get("_etabs_meta", {}).get("lpats_raw", lp) if isinstance(tables.get("_etabs_meta"), dict) else lp),
+        "_etabs_base_story": (tables.get("_etabs_meta", {}).get("base_story", "N+0.0") if isinstance(tables.get("_etabs_meta"), dict) else "N+0.0"),
     }
 
 def _infer_wall_axis_segment(wall_entity, joints):
@@ -1061,6 +1070,21 @@ def _normalize_joint_id(v):
         pass
     return s
 
+def normalize_reactions_df(df):
+    """
+    Normaliza un DataFrame de reacciones para compatibilidad SAP2000/ETABS.
+    Renombra columnas de ETABS al formato esperado por build_jloads_from_sap_reactions_excel().
+    """
+    rename_map = {
+        'Label': 'Joint',
+        'Output Case': 'OutputCase',
+        'Step Type': 'StepType',
+        'FX': 'F1', 'FY': 'F2', 'FZ': 'F3',
+        'MX': 'M1', 'MY': 'M2', 'MZ': 'M3',
+    }
+    return df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+
+
 def read_model(filepath, params):
     """
     Parsea el modelo y diagnostica la fuente de cimentación.
@@ -1079,13 +1103,21 @@ def read_model(filepath, params):
         pedir al usuario la fuente antes de continuar.
       - Si basis_mode == 'invalid_model', columns queda vacía.
     """
-    tables = parse_s2k(filepath)
+    file_format = detect_file_format(filepath)
+    if file_format == 'etabs':
+        tables = parse_e2k(filepath)
+    else:
+        tables = parse_s2k(filepath)
     joints = get_joints(tables)
     fc_t, fs_t = get_frames(tables)
     sdims = get_section_dims(tables)
     jloads = get_jloads(tables)
     lp = get_lpats(tables)
-    cl = classify(lp)
+    if file_format == 'etabs':
+        # Para ETABS usamos auto_classify_patterns (detecta por DesignType, no por nombre de patrón)
+        cl = classify_from_user(auto_classify_patterns(lp))
+    else:
+        cl = classify(lp)
     la = get_frame_local_axes(tables)
     area_conn = get_area_connectivity(tables)
     area_secs = get_area_sections(tables)
@@ -1795,6 +1827,12 @@ def run_design(model_data, classifications, params, user_ties=None, user_dims=No
 
     else:
         jloads_raw = model_data["_jloads"]
+
+    # ── Aplicar rename canónico (D, SD, Sx, Sy …) si fue configurado ─────────
+    _rename_map = model_data.get("_rename_map", {})
+    if _rename_map:
+        from export_utils import apply_rename_to_jloads as _apply_rn
+        jloads_raw = _apply_rn(jloads_raw, _rename_map)
 
     jloads_design = build_design_jloads_with_seismic_overrides(
         jloads=jloads_raw,

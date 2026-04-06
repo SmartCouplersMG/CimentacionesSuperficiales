@@ -19,8 +19,11 @@ from engine import (
     deduce_tie_beams,
     propose_rebar,
     infer_column_axis,
+    normalize_reactions_df,
 )
+from parser import auto_classify_patterns, classify_from_user
 from export_s2k import export_foundation_s2k
+# from export_e2k import export_foundation_e2k  # temporalmente suspendido
 
 st.set_page_config(
     page_title="Cimentaciones",
@@ -218,8 +221,8 @@ with st.sidebar:
               'fs_volc_min': {'q1': fs_volc_est, 'q2': fs_volc_est, 'q3': fs_volc_sis},
               'fs_desl_min': {'q1': fs_desl_est, 'q2': fs_desl_est, 'q3': fs_desl_sis}}
     st.divider()
-    st.subheader("📤 Exportación SAP2000")
-    sap_units = st.selectbox("Unidades .$2k", ["KN, m, C"], index=0)
+    st.subheader("📤 Exportación del modelo")
+    sap_units = st.selectbox("Unidades .$2k (SAP2000)", ["KN, m, C"], index=0)
     pedestal_h_exp = st.number_input("Altura pedestal exportación (m)", value=0.50, step=0.05)
     k_subgrade_exp = st.number_input("k balasto exportación (kN/m³)", value=12000.0, step=500.0)
     alpha_xy_exp = st.number_input("α resortes horizontales", value=0.35, step=0.05, min_value=0.0)
@@ -245,16 +248,24 @@ st.markdown(
     unsafe_allow_html=True
 )
 
-uploaded = st.file_uploader("Subir archivo .$2k", type=None)
+uploaded = st.file_uploader(
+    "📁 Subir modelo estructural (.$2k de SAP2000 o .e2k / .$et de ETABS)",
+    type=None,
+)
 if uploaded is None:
-    st.info("Sube un archivo .$2k de SAP2000."); st.stop()
+    st.info("Sube un archivo .$2k de SAP2000 o .e2k / .$et de ETABS.")
+    st.stop()
 
 raw = uploaded.read(); uploaded.seek(0)
-if b'TABLE:' not in raw[:1000]:
-    st.error("Archivo no válido."); st.stop()
+_is_etabs = b'PROGRAM "ETABS"' in raw[:3000] or b'PROGRAM  "ETABS"' in raw[:3000]
+_is_sap   = b'TABLE:' in raw[:1500]
+if not _is_etabs and not _is_sap:
+    st.error("Archivo no reconocido. Se esperan formatos SAP2000 (.$2k) o ETABS (.e2k / .$et).")
+    st.stop()
 
+_suffix = '.e2k' if _is_etabs else '.s2k'
 # ── PASO 0: Leer modelo + diagnosticar fuente ──
-with tempfile.NamedTemporaryFile(delete=False, suffix='.s2k') as tmp:
+with tempfile.NamedTemporaryFile(delete=False, suffix=_suffix) as tmp:
     tmp.write(raw)
     tmp_path = tmp.name
 
@@ -280,9 +291,178 @@ try:
             }
         st.session_state['classifications'] = cl_default
 
+        # Inicializar clasificación de patrones de carga (auto-detección)
+        _lpats_raw = md.get('_lpats_raw', md.get('_lp', {}))
+        _lp_auto = auto_classify_patterns(_lpats_raw)
+        st.session_state['lp_user_assignment'] = _lp_auto
+        st.session_state.pop('lp_class_confirmed', None)
+        # Limpiar estado downstream
+        for _k in ['class_applied', 'tie_beams_table', 'ties_applied', 'results', 'results_verify', 'dims_design']:
+            st.session_state.pop(_k, None)
+
     md = st.session_state['model_data']
 finally:
     os.unlink(tmp_path)
+
+
+def _lp_class_section(source_dict, md, params, label="cargas del modelo"):
+    """Renders load classification UI; stops script until confirmed.
+    source_dict: {name: type_str} — use {case: ""} for reactions output cases.
+    """
+    from collections import Counter as _Counter
+    _lp_categories = ['D', 'SD', 'L', 'Lr', 'Le', 'Wx+', 'Wx-', 'Wy+', 'Wy-', 'Sx', 'Sy', 'Ignorar']
+
+    if not source_dict:
+        return
+
+    # Detect source change → reset state
+    _src_keys = tuple(sorted(source_dict.keys()))
+    if st.session_state.get('_lp_source_keys') != _src_keys:
+        st.session_state['_lp_source_keys'] = _src_keys
+        st.session_state['lp_user_assignment'] = auto_classify_patterns(source_dict)
+        st.session_state.pop('lp_class_confirmed', None)
+
+    lp_assign = st.session_state.get('lp_user_assignment', auto_classify_patterns(source_dict))
+
+    st.subheader(f"📂 Clasificación de {label}")
+    lp_rows = []
+    for name, typ in source_dict.items():
+        lp_rows.append({
+            'Nombre': name,
+            'Tipo (archivo)': typ if typ else '—',
+            'Categoría diseño': lp_assign.get(name, 'Ignorar'),
+        })
+
+    with st.form('lp_class_form', clear_on_submit=False):
+        lp_edited = st.data_editor(
+            pd.DataFrame(lp_rows),
+            column_config={
+                'Nombre':           st.column_config.TextColumn(disabled=True, width='medium'),
+                'Tipo (archivo)':   st.column_config.TextColumn(disabled=True, width='medium'),
+                'Categoría diseño': st.column_config.SelectboxColumn(
+                    options=_lp_categories, required=True, width='medium'),
+            },
+            use_container_width=True, hide_index=True, key='lp_class_editor',
+        )
+        lp_confirm = st.form_submit_button("✅ Confirmar clasificación de cargas",
+                                           type='primary', use_container_width=True)
+
+    if lp_confirm:
+        new_assign = {row['Nombre']: row['Categoría diseño'] for _, row in lp_edited.iterrows()}
+        warns = []
+        cnt = _Counter(new_assign.values())
+        for cat in ('Sx', 'Sy'):
+            if cnt.get(cat, 0) > 1:
+                warns.append(f"⚠️ Múltiples cargas asignadas a '{cat}': "
+                             f"{', '.join(p for p, c in new_assign.items() if c == cat)}")
+        if 'D' not in new_assign.values():
+            warns.append("⚠️ Ninguna carga asignada como Muerta (D).")
+        for w in warns:
+            st.warning(w)
+
+        # ── Build rename map: original → canonical (None = ignorar) ───────────
+        from export_utils import CAT_TO_DESTYPE as _CAT_DT
+        _cat_to_cl_key = {
+            'D': 'dead', 'SD': 'superdead', 'L': 'live', 'Lr': 'live_roof', 'Le': 'live_eq',
+            'Sx': 'seismic_x', 'Sy': 'seismic_y',
+            'Wx+': 'wind_xp', 'Wx-': 'wind_xn', 'Wy+': 'wind_yp', 'Wy-': 'wind_yn',
+        }
+        _cat_ctr: dict = {}
+        _rmap: dict = {}   # original → canonical_name | None
+        for _orig, _cat in new_assign.items():
+            if _cat == 'Ignorar':
+                _rmap[_orig] = None
+                continue
+            _cat_ctr[_cat] = _cat_ctr.get(_cat, 0) + 1
+            _n = _cat_ctr[_cat]
+            _rmap[_orig] = _cat if _n == 1 else f"{_cat}_{_n}"
+
+        # ── Guardar originales (solo la primera vez) ───────────────────────────
+        if '_jloads_orig' not in md:
+            md['_jloads_orig'] = {j: dict(v) for j, v in (md.get('_jloads') or {}).items()}
+        if '_lp_orig' not in md:
+            md['_lp_orig'] = dict(md.get('_lp') or {})
+
+        # ── Renombrar _jloads desde los originales ─────────────────────────────
+        _new_jloads: dict = {}
+        for _jid, _pj in md['_jloads_orig'].items():
+            _renamed: dict = {}
+            for _orig, _fv in _pj.items():
+                _exp = _rmap.get(_orig, _orig)   # casos desconocidos: mantener nombre
+                if _exp is None:
+                    continue                      # ignorados
+                if _exp in _renamed:
+                    for _k in _renamed[_exp]:
+                        _renamed[_exp][_k] = _renamed[_exp].get(_k, 0) + _fv.get(_k, 0)
+                else:
+                    _renamed[_exp] = dict(_fv)
+            if _renamed:
+                _new_jloads[_jid] = _renamed
+
+        # ── Renombrar _lp desde los originales ────────────────────────────────
+        _new_lp: dict = {}
+        for _orig, _dt in md['_lp_orig'].items():
+            _exp = _rmap.get(_orig)
+            if _exp is None:
+                continue                          # ignorados
+            if _exp not in _new_lp:
+                _new_lp[_exp] = _CAT_DT.get(new_assign.get(_orig, ''), _dt)
+        # Conservar patrones desconocidos (no en new_assign)
+        for _orig, _dt in md['_lp_orig'].items():
+            if _orig not in _rmap and _orig not in _new_lp:
+                _new_lp[_orig] = _dt
+
+        # ── Construir _cl con nombres canónicos ───────────────────────────────
+        _new_cl: dict = {_k: [] for _k in list(_cat_to_cl_key.values()) + ['other']}
+        for _orig, _cat in new_assign.items():
+            if _cat == 'Ignorar':
+                continue
+            _exp = _rmap.get(_orig)
+            if _exp is None:
+                continue
+            _cl_key = _cat_to_cl_key.get(_cat, 'other')
+            if _exp not in _new_cl[_cl_key]:
+                _new_cl[_cl_key].append(_exp)
+
+        # ── assignment canónico para export (canonical → category) ────────────
+        _canonical_assign = {
+            _exp: _cat
+            for _orig, _cat in new_assign.items()
+            if (_exp := _rmap.get(_orig)) is not None and _cat != 'Ignorar'
+        }
+
+        md['_jloads']            = _new_jloads
+        md['_lp']                = _new_lp
+        md['_cl']                = _new_cl
+        md['_lp_user_assignment'] = _canonical_assign   # {canonical: category} para export
+        md['_rename_map']         = _rmap               # {original: canonical | None} para run_design
+
+        # ── Renombrar design_jloads si ya está en md (modo joint_loads) ───────
+        from export_utils import apply_rename_to_jloads as _arj
+        if md.get('design_jloads'):
+            md['design_jloads'] = _arj(md['design_jloads'], _rmap)
+
+        new_combos = __import__('parser').gen_combos(_new_cl, R=params['R'])
+        md['n_combos'] = {'ADS': len(new_combos['ADS']), 'LRFD': len(new_combos['LRFD'])}
+
+        st.session_state['lp_user_assignment'] = new_assign   # {original: category} para UI
+        st.session_state['lp_class_confirmed'] = True
+        st.session_state['model_data'] = md
+        st.rerun()
+
+    if not st.session_state.get('lp_class_confirmed', False):
+        st.info("👆 Revise y confirme la clasificación de cargas para continuar.")
+        st.stop()
+
+    # Mostrar resumen con nombres CANÓNICOS (no los del archivo de origen)
+    canonical_assign = md.get('_lp_user_assignment', {})   # {canonical: category}
+    if canonical_assign:
+        by_cat: dict = {}
+        for _exp, _cat in canonical_assign.items():
+            by_cat.setdefault(_cat, []).append(_exp)
+        st.success("✅ Clasificación confirmada — " +
+                   ' | '.join(f"**{c}**: {', '.join(sorted(ps))}"
+                               for c, ps in sorted(by_cat.items())))
 
 # ── Mostrar advertencias generales del modelo ──
 if md.get('warnings'):
@@ -384,17 +564,22 @@ md["wall_foundation_entities"] = wall_foundation_entities
 if basis_mode == 'joint_loads':
     st.success(
         f"✅ Fuente activa: fuerzas en nudos | "
-        f"{len(design_entities)} entidades de diseño detectadas"
+        f"{len(design_entities)} entidades de diseño detectadas | "
         f"{md['n_combos']['ADS']}+{md['n_combos']['LRFD']} combinaciones"
     )
+    # Clasificación de cargas usando patrones del modelo
+    _lpats_raw = md.get('_lpats_raw', md.get('_lp', {}))
+    _lp_class_section(_lpats_raw, md, params, "patrones de carga del modelo")
 elif basis_mode == 'support_reactions':
     st.success(
         f"✅ Fuente activa: restricciones/apoyos base | "
         f"{len(design_entities)} entidades de diseño detectadas"
     )
 
+    _file_fmt = md.get('file_format', 'sap2000')
+    _react_label = "SAP2000" if _file_fmt == 'sap2000' else "ETABS"
     file_xlsx = st.file_uploader(
-        "📥 Suba el Excel de reacciones exportado desde SAP2000",
+        f"📥 Suba el Excel de reacciones exportado desde {_react_label}",
         type=["xlsx"],
         key="reactions_xlsx"
     )
@@ -404,7 +589,30 @@ elif basis_mode == 'support_reactions':
         st.stop()
 
     file_xlsx.seek(0)
-    df_react_preview = pd.read_excel(file_xlsx, sheet_name="Joint Reactions", header=1)
+    try:
+        df_react_preview = pd.read_excel(file_xlsx, sheet_name="Joint Reactions", header=1)
+    except Exception:
+        file_xlsx.seek(0)
+        df_react_preview = pd.read_excel(file_xlsx, header=1)
+
+    # Normalizar nombres de columna (ETABS usa nombres diferentes a SAP2000)
+    df_react_preview = normalize_reactions_df(df_react_preview)
+
+    # Para ETABS: filtrar solo piso base si hay columna 'Story'
+    if _file_fmt == 'etabs' and 'Story' in df_react_preview.columns:
+        _base_story = md.get('_etabs_base_story', 'N+0.0')
+        df_react_preview = df_react_preview[
+            df_react_preview['Story'].astype(str).str.strip() == _base_story
+        ].copy()
+        if df_react_preview.empty:
+            st.warning(f"No se encontraron reacciones para el piso base '{_base_story}'. Se usarán todos los datos.")
+            file_xlsx.seek(0)
+            try:
+                df_react_preview = normalize_reactions_df(
+                    pd.read_excel(file_xlsx, sheet_name="Joint Reactions", header=1)
+                )
+            except Exception:
+                pass
 
     st.session_state["reactions_file"] = file_xlsx
     st.session_state["reactions_df"] = df_react_preview
@@ -498,7 +706,13 @@ elif basis_mode == 'support_reactions':
         wall_as_column_jloads,
     )
 
-    # 7) Persistir TODO en md para que sobreviva al rerun
+    # 7) Aplicar rename canónico a design_jloads si la clasificación ya fue confirmada
+    _rmap_active = md.get("_rename_map", {})
+    if _rmap_active:
+        from export_utils import apply_rename_to_jloads as _arj2
+        design_jloads = _arj2(design_jloads, _rmap_active)
+
+    # 8) Persistir TODO en md para que sobreviva al rerun
     md["wall_entities"] = wall_entities
     md["wall_resultants"] = wall_resultants
     md["wall_foundation_entities"] = wall_foundation_entities
@@ -540,6 +754,14 @@ elif basis_mode == 'support_reactions':
             st.session_state.pop(k, None)
 
     st.session_state["_design_entity_ids_support_reactions"] = current_entity_ids
+
+    # Clasificación usando los casos de carga del Excel (OutputCase)
+    if 'OutputCase' in df_react_preview.columns:
+        _react_cases = {c: "" for c in sorted(
+            df_react_preview['OutputCase'].dropna().astype(str).unique())}
+    else:
+        _react_cases = md.get('_lpats_raw', md.get('_lp', {}))
+    _lp_class_section(_react_cases, md, params, "casos de carga (Excel de reacciones)")
 
 else:
     st.info(
@@ -1604,12 +1826,13 @@ with tab_export:
             pd.DataFrame(csv_rows).to_csv(index=False),
             file_name="resumen.csv", mime="text/csv")
 
-    # ── EXPORTACIÓN SAP2000 ──
+    # ── EXPORTACIÓN SAP2000 / ETABS ──
     st.divider()
-    st.subheader("🏗️ Exportación SAP2000")
+    st.subheader("🏗️ Exportación del modelo de cimentación")
 
+    _base_model_name = uploaded.name.rsplit(".", 1)[0] + "_CIMENTACION"
     export_cfg = {
-        "model_name": uploaded.name.rsplit(".", 1)[0] + "_CIMENTACION",
+        "model_name": _base_model_name,
         "units": sap_units,
         "pedestal_h": pedestal_h_exp,
         "z_top": z_top_exp,
@@ -1625,7 +1848,7 @@ with tab_export:
             "Client Name": "Sin Nombre",
             "Project Name": "Sin Nombre",
             "Project Number": "001",
-            "Model Name": uploaded.name.rsplit(".", 1)[0] + "_CIMENTACION",
+            "Model Name": _base_model_name,
             "Model Description": "Modelo creado a partir de una aplicacion web creada con IA",
             "Revision Number": "001",
             "Frame Type": "Sistema de Cimentaciones Superficiales",
@@ -1640,6 +1863,7 @@ with tab_export:
     sx1, sx2 = st.columns(2)
 
     with sx1:
+        st.markdown("**SAP2000 (.$2k)**")
         if st.button("🧱 Generar .$2k SAP2000", type="primary", use_container_width=True, key="btn_generar_s2k_export_tab"):
             try:
                 md_export = dict(md)
@@ -1650,27 +1874,28 @@ with tab_export:
                     params=params,
                     export_cfg=export_cfg
                 )
-
                 if 'TABLE:  "PROGRAM CONTROL"' not in s2k_text:
                     raise ValueError("El .$2k generado no contiene la tabla PROGRAM CONTROL")
-
                 st.session_state["sap_s2k_text"] = s2k_text
                 st.success("Archivo .$2k generado correctamente.")
             except Exception as e:
-                st.error(f"Error al generar exportación SAP2000: {e}")
+                st.error(f"Error al generar SAP2000: {e}")
 
-    with sx2:
         if "sap_s2k_text" in st.session_state:
             st.download_button(
-                "📥 Descargar cimentacion_exportada.$2k",
+                "📥 Descargar .$2k",
                 data=st.session_state["sap_s2k_text"],
-                file_name="cimentacion_exportada.$2k",
+                file_name=f"{_base_model_name}.$2k",
                 mime="text/plain",
                 use_container_width=True,
                 key="btn_descargar_s2k_export_tab",
             )
 
-    st.caption("La exportación SAP2000 se genera únicamente desde esta pestaña.")
+    with sx2:
+        st.markdown("**ETABS (.e2k)**")
+        st.info("🔧 Exportación ETABS temporalmente suspendida — en revisión.")
+
+    st.caption("Los archivos se generan únicamente desde esta pestaña.")
 
     # ── EXCEL COMPLETO ──
     st.divider()
