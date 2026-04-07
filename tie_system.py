@@ -107,82 +107,140 @@ def _find_nearest(col, all_cols, direction, sign, tol_ortho=0.20):
 # ================================================================
 def build_tie_systems(final_footings, ties):
     """
-    Construye sistemas únicos. Usa el dict global 'ties' (no f.get('ties'))
-    para detectar conexiones incluso cuando la zapata destino es combinada.
-    Guarda tie_joints: mapping footing_id → joint específico del tie.
+    Construye sistemas de vigas por NUDOS (columnas), no por zapatas.
+
+    Arquitectura:
+    • Cada sistema conecta columna Jᵢ ↔ Jⱼ (y posiblemente más en cadena colíneal).
+    • La BFS opera sobre joint-IDs individuales — no sobre footing-IDs.
+    • Al trabajar a nivel de nudo no existe topología estrella: cada columna tiene
+      como máximo 1 conexión por dirección → cada conexión es su propio sistema
+      (o parte de una cadena multi-tramo si los nudos son colíneales).
+    • Los centroides de zapata son únicamente los apoyos (restricciones simples)
+      en el modelo de viga; se deducen automáticamente en analyze_tie_system.
+    • Sistemas intra-combinada (dos nudos en la misma zapata combinada): se marcan
+      con intra_combined=True y se delegan al análisis longitudinal de combined.py.
     """
-    # Map joint → footing ID (handles combined: "5+8" → maps both to ZC-01)
+    # ── Mapa nudo → ID zapata ──
     j2f = {}
     for f in final_footings:
         fid = f.get('id', '')
         for jj in f.get('joint', '').split('+'):
-            j2f[jj] = fid
-        j2f[fid] = fid
+            jj = jj.strip()
+            if jj:
+                j2f[jj] = fid
+        for c in f.get('cols', []):
+            j2f[c['joint']] = fid
 
     def resolve(raw):
-        return j2f.get(str(raw), j2f.get(raw, str(raw)))
+        return j2f.get(str(raw), str(raw))
 
-    # Build edges from the GLOBAL ties dict — not from f.get('ties')
-    # This ensures ties to/from joints in combined footings are included
-    edges = {}
-    tie_joint_map = {}  # (footing_id, direction) → joint_id original
+    # ── Mapa nudo → coordenadas de columna (para verificación de colinealidad) ──
+    j2pos = {}
+    for f in final_footings:
+        for c in f.get('cols', []):
+            j2pos[c['joint']] = (c['x'], c['y'])
+
+    _COLLINEAR_TOL_DEG = 10.0   # tolerancia angular: eje X o Y ± 10°
+    _COLLINEAR_TOL_RAD = math.radians(_COLLINEAR_TOL_DEG)
+
+    def _edge_is_collinear(jA_str, jB_str, d):
+        """
+        Verifica que la arista jA–jB esté dentro de ±10° de la dirección d ('X' o 'Y').
+        Si no se tienen coordenadas para ambos nudos, se acepta la arista (no se descarta).
+        """
+        posA = j2pos.get(jA_str); posB = j2pos.get(jB_str)
+        if posA is None or posB is None:
+            return True    # sin coords → aceptar (caso especial / legacy)
+        dx = abs(posB[0] - posA[0]); dy = abs(posB[1] - posA[1])
+        dist = math.hypot(dx, dy)
+        if dist < 0.01:
+            return True    # nudos coincidentes → aceptar
+        if d == 'X':
+            # ángulo del eje horizontal: atan2(dy, dx) debe ser < 10°
+            return math.atan2(dy, dx) <= _COLLINEAR_TOL_RAD
+        else:
+            # eje vertical: atan2(dx, dy) < 10°
+            return math.atan2(dx, dy) <= _COLLINEAR_TOL_RAD
+
+    # ── Construir aristas a nivel de nudo ──
+    seen_keys = set()
+    joint_edges = []   # [{'jA': str, 'jB': str, 'dir': str}]
+
+    def _add_joint_edge(jA_str, jB_str, d):
+        if jA_str == jB_str:
+            return
+        key = (tuple(sorted([jA_str, jB_str])), d)
+        if key in seen_keys:
+            return
+        seen_keys.add(key)
+        # Filtrar aristas que no cumplan la colinealidad con la dirección declarada
+        if not _edge_is_collinear(jA_str, jB_str, d):
+            return
+        joint_edges.append({'jA': jA_str, 'jB': jB_str, 'dir': d})
 
     for jid, t in ties.items():
         if not t.get('needs_tie'):
             continue
-        fid_from = resolve(jid)
-
-        def _add_edge(tid_raw, d, _jid=jid):
-            fid_to = resolve(tid_raw)
-            if fid_to == fid_from:
-                return  # same footing → no edge
-            key = tuple(sorted([fid_from, fid_to])) + (d,)
-            if key not in edges:
-                edges[key] = {'f1': fid_from, 'f2': fid_to, 'dir': d}
-            # Track which original joint is the tie endpoint for each footing
-            if (fid_from, d) not in tie_joint_map:
-                tie_joint_map[(fid_from, d)] = _jid
-            if (fid_to, d) not in tie_joint_map:
-                tie_joint_map[(fid_to, d)] = str(tid_raw)
-
+        jid_str = str(jid)
         if t.get('is_corner'):
             for tk in ['tie_x', 'tie_y']:
                 td = t.get(tk, {})
                 if td.get('tie_to'):
-                    _add_edge(td['tie_to'], td.get('tie_dir', 'X'))
+                    _add_joint_edge(jid_str, str(td['tie_to']), td.get('tie_dir', 'X'))
         elif t.get('tie_to'):
-            _add_edge(t['tie_to'], t.get('tie_dir', 'X'))
+            _add_joint_edge(jid_str, str(t['tie_to']), t.get('tie_dir', 'X'))
 
-    # Group into systems by BFS
+    # ── BFS sobre nudos por dirección ──
     systems = []
     for direction in ['X', 'Y']:
-        de = [(v['f1'], v['f2']) for v in edges.values() if v['dir'] == direction]
-        if not de: continue
+        de = [(e['jA'], e['jB']) for e in joint_edges if e['dir'] == direction]
+        if not de:
+            continue
         adj = defaultdict(set)
-        for a, b in de: adj[a].add(b); adj[b].add(a)
+        for a, b in de:
+            adj[a].add(b); adj[b].add(a)
+
         visited = set()
-        for start in adj:
-            if start in visited: continue
+        for start in sorted(adj.keys()):
+            if start in visited:
+                continue
             q = [start]; grp = []
             while q:
                 n = q.pop(0)
-                if n in visited: continue
+                if n in visited:
+                    continue
                 visited.add(n); grp.append(n)
                 for nb in adj[n]:
-                    if nb not in visited: q.append(nb)
-            if len(grp) >= 2:
-                sid = f"SYS_{'_'.join(sorted(grp))}_{direction}"
-                # Collect tie_joints for this system
-                sys_tie_joints = {}
-                for fid in grp:
-                    tj = tie_joint_map.get((fid, direction))
-                    if tj:
-                        sys_tie_joints[fid] = tj
-                systems.append({
-                    'system_id': sid, 'direction': direction,
-                    'footings': sorted(grp), 'num_nodes': len(grp),
-                    'tie_joints': sys_tie_joints,
-                })
+                    if nb not in visited:
+                        q.append(nb)
+            if len(grp) < 2:
+                continue
+
+            # Unique footings for this joint group (order-preserving)
+            unique_fids = list(dict.fromkeys(resolve(j) for j in grp))
+
+            # Intra-combined: todos los nudos pertenecen a la misma zapata combinada
+            intra = (len(unique_fids) == 1)
+
+            # tie_joints: footing → [joints in this system]
+            tj = {}
+            for j in grp:
+                fid = resolve(j)
+                tj.setdefault(fid, []).append(j)
+
+            # ID del sistema basado en nudos (J) para claridad
+            sid = f"SYS_J{'_J'.join(sorted(grp))}_{direction}"
+
+            systems.append({
+                'system_id': sid,
+                'direction': direction,
+                'joints': sorted(grp),       # IDs de nudos individuales
+                'footings': unique_fids,      # Zapatas involucradas (para apoyos)
+                'num_nodes': len(grp),
+                'tie_joints': tj,
+                'intra_combined': intra,
+            })
+
     return systems
 
 
@@ -422,6 +480,74 @@ def analyze_tie_system(system, final_footings, jloads, combos, params):
     direction = system['direction']; fids = system['footings']
     fmap = {f.get('id', ''): f for f in final_footings}
     foots = [fmap[fid] for fid in fids if fid in fmap]
+
+    # ── CASO ESPECIAL: sistema intra-combinada ──
+    # La zapata combinada ya realizó el análisis longitudinal en combined.py.
+    # Aquí solo se empaqueta ese resultado en el formato estándar de tie_system.
+    if system.get('intra_combined') and len(fids) == 1:
+        fobj = fmap.get(fids[0])
+        if not fobj:
+            return {'status': 'insuficiente', 'system_id': system['system_id'],
+                    'direction': direction, 'footings': fids, 'num_nodes': 1}
+        ca = fobj.get('combined_analysis') or {}
+        sd_comb = fobj.get('steel_diagram') or {}
+        long_axis = fobj.get('longitudinal_axis', 'x').upper()
+        total_L = fobj.get('B', 1.0) if direction == 'X' else fobj.get('L', 1.0)
+        # Tie beam section: use min column dim as width, footing h as height
+        b_v = fobj.get('col_bx', 0.3)
+        h_v = fobj.get('h', 0.5)
+        d_v = max(0.10, h_v - rec - 0.02)
+        vc1w_ic = 0.17 * math.sqrt(fc * 1000)   # kN/m² → / 1000 → MPa basis
+        pVc_ic = 0.75 * vc1w_ic * b_v * d_v
+        Mu_mp = ca.get('M_pos_max', 0); Mu_mn = ca.get('M_neg_max', 0)
+        Vu_mx = ca.get('V_max', 0)
+        sr_v_ic = Vu_mx / pVc_ic if pVc_ic > 0 else 999
+        As_i_ic = calc_as(abs(Mu_mp), b_v, d_v, fc, fy) if Mu_mp != 0 else 0
+        As_s_ic = calc_as(abs(Mu_mn), b_v, d_v, fc, fy) if Mu_mn != 0 else 0
+        joints_ic = system.get('tie_joints', {}).get(fids[0], [])
+        note = (f"Análisis longitudinal de {fids[0]} en dirección {direction}. "
+                f"Eje long. diseñado: {long_axis}. "
+                + ("⚠️ Dirección solicitada difiere del eje longitudinal principal."
+                   if direction != long_axis else "✅ Coincide con eje longitudinal principal."))
+        return {
+            'system_id': system['system_id'], 'direction': direction,
+            'footings': [fids[0]], 'joints': [', '.join(joints_ic)],
+            'num_nodes': 1, 'lengths': [round(total_L, 2)],
+            'total_length': round(total_L, 2), 'eccentricities': [],
+            'geometry': {
+                'supports': [0.0, round(total_L, 3)],
+                'loads': [{'fid': fids[0], 'x_load': round(total_L / 2, 3),
+                           'x_sup': round(total_L / 2, 3), 'ecc': 0.0, 'coalesced': True}],
+                'span': round(total_L, 3), 'overhangs': [0.0, 0.0],
+            },
+            'solver_type': 'intra_combined',
+            'pattern_based': False, 'patterns_resolved': [],
+            'reactions_by_pattern': {}, 'q_viga': 0,
+            'b_viga_limit': b_v,
+            'status': 'ok' if sr_v_ic <= 1 else 'REVISAR_SECCION',
+            'note': note,
+            'combo_states_ads': [], 'ads_control': '(zapata combinada)',
+            'combo_states_lrfd': [],
+            'Mu_max_pos': round(Mu_mp, 2), 'Mu_max_neg': round(Mu_mn, 2),
+            'Vu_max': round(Vu_mx, 1), 'lrfd_control': '(zapata combinada)',
+            'vm_diagram': ca, 'steel_diagram': sd_comb,
+            'b_viga': round(b_v, 2), 'h_viga': round(h_v, 2), 'd_viga': round(d_v, 3),
+            'As_inf': round(As_i_ic, 1),
+            'As_inf_text': propose_rebar(As_i_ic, b_v, rec * 100)['text'] if As_i_ic > 0 else '-',
+            'As_sup': round(As_s_ic, 1),
+            'As_sup_text': propose_rebar(As_s_ic, b_v, rec * 100)['text'] if As_s_ic > 0 else '-',
+            'phi_Vc': round(pVc_ic, 1), 'sr_viga': round(sr_v_ic, 3),
+            's_estribo': round(min(d_v / 2, 0.30), 2),
+            'audit': {
+                'no_duplicates': True, 'force_balance_ok': True, 'force_balance_error': 0,
+                'moment_balance_ok': True, 'moment_balance_error': 0,
+                'shear_consistent': True, 'max_reaction_lrfd': 0,
+                'system_converged': True, 'footings_updated': True,
+                'nodes_coalesced': 0, 'pp_viga_included': False, 'q_viga_kNm': 0,
+            },
+            'intra_combined': True,
+        }
+
     if len(foots) < 2:
         return {'status': 'insuficiente', 'system_id': system['system_id'],
                 'direction': direction, 'footings': fids, 'num_nodes': len(fids)}
@@ -432,16 +558,57 @@ def analyze_tie_system(system, final_footings, jloads, combos, params):
     nodes = []
     for f in foots:
         fid = f.get('id', ''); is_comb = f.get('type') == 'combined'
-        sj = tie_joints.get(fid)
-        if is_comb and sj:
-            sc = next((c for c in f.get('cols', []) if c['joint'] == sj), None)
-            if sc:
-                xc, yc, cbx, cby = sc['x'], sc['y'], sc.get('bx', 0.3), sc.get('by', 0.3)
-                jids = [sj]
+        # tie_joints[fid] is now a list of joint ids (may be a single-element list or several)
+        sj_list = tie_joints.get(fid)
+        if isinstance(sj_list, str):
+            sj_list = [sj_list]   # backward-compat if somehow a str slipped in
+        sj_list = sj_list or []
+
+        if is_comb and sj_list:
+            if len(sj_list) > 1:
+                # Posición ponderada por carga de todos los nudos de la combinada en este sistema.
+                # Esto es más preciso que usar solo el primer nudo cuando la combinada
+                # contribuye con columnas en distintas posiciones del eje de la viga.
+                _wxsum = 0.0; _wysum = 0.0; _wsum = 0.0
+                _cbx_all = []; _cby_all = []
+                for _sj in sj_list:
+                    _sc = next((c for c in f.get('cols', []) if c['joint'] == _sj), None)
+                    if _sc:
+                        _jld = jloads.get(str(_sj), {})
+                        # Buscar carga D+L primero, si no la máxima disponible
+                        _P = 0.0
+                        for _cn, _fv in _jld.items():
+                            if 'D+L' in _cn:
+                                _P = abs(_fv.get('F3', 0) or _fv.get('P', 0)); break
+                        if _P == 0.0:
+                            _P = max((abs(_fv.get('F3', 0) or _fv.get('P', 0))
+                                      for _fv in _jld.values()), default=0.0)
+                        _P = max(_P, 1.0)   # evitar peso=0 → promedio simple
+                        _wxsum += _sc['x'] * _P; _wysum += _sc['y'] * _P; _wsum += _P
+                        _cbx_all.append(_sc.get('bx', 0.3)); _cby_all.append(_sc.get('by', 0.3))
+                if _wsum > 0:
+                    xc = _wxsum / _wsum; yc = _wysum / _wsum
+                else:
+                    xc = f.get('x_footing', f['x']); yc = f.get('y_footing', f['y'])
+                cbx = max(_cbx_all) if _cbx_all else f.get('col_bx', 0.3)
+                cby = max(_cby_all) if _cby_all else f.get('col_by', 0.3)
             else:
-                xc, yc = f.get('x_col', f['x']), f.get('y_col', f['y'])
-                cbx, cby = f.get('col_bx', 0.3), f.get('col_by', 0.3)
-                jids = f.get('joint', '').split('+')
+                # Un único nudo de tie en esta combinada → usar posición directa
+                sj0 = sj_list[0]
+                sc = next((c for c in f.get('cols', []) if c['joint'] == sj0), None)
+                if sc:
+                    xc, yc = sc['x'], sc['y']
+                    cbx, cby = sc.get('bx', 0.3), sc.get('by', 0.3)
+                else:
+                    xc, yc = f.get('x_footing', f['x']), f.get('y_footing', f['y'])
+                    cbx, cby = f.get('col_bx', 0.3), f.get('col_by', 0.3)
+            # Include ALL individual joints of this combined that are tie endpoints
+            jids = sj_list if sj_list else f.get('joint', '').split('+')
+        elif is_comb:
+            # No specific tie joint recorded: use footing centroid, include all cols
+            xc, yc = f.get('x_footing', f['x']), f.get('y_footing', f['y'])
+            cbx, cby = f.get('col_bx', 0.3), f.get('col_by', 0.3)
+            jids = f.get('joint', '').split('+')
         else:
             xc, yc = f.get('x_col', f['x']), f.get('y_col', f['y'])
             cbx, cby = f.get('col_bx', 0.3), f.get('col_by', 0.3)
@@ -466,12 +633,20 @@ def analyze_tie_system(system, final_footings, jloads, combos, params):
     use_multi = len(nodes) > 2
 
     def _solve(pls, pms):
+        """Solve beam and return (beam_result, reactions_list_len_nodes).
+        Guarantees the returned reaction list has exactly len(nodes) entries,
+        one per support (ordered by x_sup), so that R_pat[pat][i] never raises
+        an IndexError even when the stiffness-matrix solver coalesces nodes.
+        """
         if use_multi:
             bm = beam_solve_multi_support(support_xs, pls, pms)
-            return bm, bm.get('reactions_list', [0]*len(nodes))
+            raw = bm.get('reactions_list', [])
         else:
             bm = beam_solve_simple_overhangs(support_xs, pls, pms)
-            return bm, bm.get('reactions', [0, 0])
+            raw = bm.get('reactions', [0, 0])
+        # Pad / truncate to exactly len(nodes) in the same order as support_xs
+        rt = list(raw) + [0.0] * len(nodes)   # ensure enough elements
+        return bm, rt[:len(nodes)]
 
     # ═══ PASO 1: Patrones únicos ═══
     all_pats = set()

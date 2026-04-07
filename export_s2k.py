@@ -414,9 +414,15 @@ def export_foundation_s2k(model_data, results, params, export_cfg=None):
         if sys.get("status") in ("insuficiente", "distancia_insuficiente"):
             continue
         fids = sys.get("footings", [])
-        for i in range(len(fids) - 1):
-            pair_to_system[(fids[i], fids[i + 1], sys.get("direction", "X"))] = sys["system_id"]
-            pair_to_system[(fids[i + 1], fids[i], sys.get("direction", "X"))] = sys["system_id"]
+        _dir = sys.get("direction", "X")
+        _sid = sys["system_id"]
+        # Usar TODOS los pares de zapatas del sistema (grafo completo), no solo consecutivos.
+        # El BFS retorna footings en orden de visita, que puede no ser el orden espacial,
+        # por lo que pares consecutivos no cubren todas las conexiones directas posibles.
+        for _i in range(len(fids)):
+            for _j in range(_i + 1, len(fids)):
+                pair_to_system[(fids[_i], fids[_j], _dir)] = _sid
+                pair_to_system[(fids[_j], fids[_i], _dir)] = _sid
 
     tie_done = set()
 

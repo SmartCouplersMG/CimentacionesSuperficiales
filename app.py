@@ -815,17 +815,60 @@ st.plotly_chart(fig0, use_container_width=True)
 
 # Tabla de clasificación editable
 st.subheader("Clasificación por entidad")
-st.caption("Modifique la localización de cada columna. Los cambios se aplican al presionar el botón.")
+st.caption("Modifique la localización de cada columna. "
+           "Mpx/Mpy y Vux/Vuy muestran el máximo sísmico de referencia — ajuste si necesita.")
 
 cl = st.session_state['classifications']
 loc_options = ['concentrica', 'medianera', 'esquinera']
 side_options = ['', 'X+', 'X-', 'Y+', 'Y-']
 corner_options = ['', 'X+Y+', 'X+Y-', 'X-Y+', 'X-Y-']
 
+# ── Calcular Mp/Vu de referencia = fuerzas sísmicas efectivas (Sx/R, Sy/R) ───
+def _seismic_ref(jid_str, jloads_dict, cl_dict, R_factor):
+    """
+    Devuelve (mpx, mpy, vux, vuy) como los valores máximos resultantes de
+    aplicar los patrones sísmicos con factor 1/R — exactamente como hace
+    gen_combos con Ex(f) = fac("seismic_x", f/R).
+
+    cl_dict: md['_cl']  →  {'seismic_x': ['Sx', ...], 'seismic_y': ['Sy', ...], ...}
+    """
+    mpx = mpy = vux = vuy = 0.0
+    R = R_factor if R_factor and R_factor > 0 else 1.0
+
+    # Patrones clasificados como sísmicos en X e Y
+    sx_pats = cl_dict.get('seismic_x', [])
+    sy_pats = cl_dict.get('seismic_y', [])
+
+    joint_loads = jloads_dict.get(jid_str, {})
+
+    for _pat in sx_pats:
+        _fv = joint_loads.get(_pat, {})
+        if not _fv:
+            continue
+        # Ex = Sx / R  →  My = M2/R,  Vx = F1/R
+        mpx = max(mpx, abs(_fv.get('M2', 0)) / R)
+        vux = max(vux, abs(_fv.get('F1', 0)) / R)
+
+    for _pat in sy_pats:
+        _fv = joint_loads.get(_pat, {})
+        if not _fv:
+            continue
+        # Ey = Sy / R  →  Mx = M1/R,  Vy = F2/R
+        mpy = max(mpy, abs(_fv.get('M1', 0)) / R)
+        vuy = max(vuy, abs(_fv.get('F2', 0)) / R)
+
+    return round(mpx, 2), round(mpy, 2), round(vux, 2), round(vuy, 2)
+
+_jloads_ref  = md.get('_jloads') or md.get('design_jloads') or {}
+_cl_ref      = md.get('_cl', {})
+_R_ref       = params.get('R', 1.0)
+
 edit_rows = []
 for c in design_entities:
     jid = str(c['joint'])
     ci = cl.get(jid, {})
+    # Usar valor guardado si el usuario ya lo definió (≠ 0), sino sugerir el sísmico
+    _ref_mpx, _ref_mpy, _ref_vux, _ref_vuy = _seismic_ref(jid, _jloads_ref, _cl_ref, _R_ref)
     edit_rows.append({
         'Nodo': f'J{jid}',
         'Familia': c.get('design_family', 'column'),
@@ -833,10 +876,10 @@ for c in design_entities:
         'Localización': ci.get('location', 'concentrica'),
         'Lado lindero': ci.get('side', ''),
         'Esquina lindero': ci.get('corner', ''),
-        'Mpx': ci.get('mpx', 0.0),
-        'Mpy': ci.get('mpy', 0.0),
-        'Vux': ci.get('vux', 0.0),
-        'Vuy': ci.get('vuy', 0.0),
+        'Mpx': ci.get('mpx') if ci.get('mpx', 0.0) != 0.0 else _ref_mpx,
+        'Mpy': ci.get('mpy') if ci.get('mpy', 0.0) != 0.0 else _ref_mpy,
+        'Vux': ci.get('vux') if ci.get('vux', 0.0) != 0.0 else _ref_vux,
+        'Vuy': ci.get('vuy') if ci.get('vuy', 0.0) != 0.0 else _ref_vuy,
     })
 
 df_edit = pd.DataFrame(edit_rows)
@@ -851,10 +894,10 @@ with st.form("class_form", clear_on_submit=False):
             'Localización': st.column_config.SelectboxColumn(options=loc_options, required=True),
             'Lado lindero': st.column_config.SelectboxColumn(options=side_options),
             'Esquina lindero': st.column_config.SelectboxColumn(options=corner_options),
-            'Mpx': st.column_config.NumberColumn("Mp en X", min_value=0.0, step=1.0, format="%.2f", width='small'),
-            'Mpy': st.column_config.NumberColumn("Mp en Y", min_value=0.0, step=1.0, format="%.2f", width='small'),
-            'Vux': st.column_config.NumberColumn("Vu en X", min_value=0.0, step=1.0, format="%.2f", width='small'),
-            'Vuy': st.column_config.NumberColumn("Vu en Y", min_value=0.0, step=1.0, format="%.2f", width='small'),
+            'Mpx': st.column_config.NumberColumn("Mp en X", min_value=0.0, step=0.01, format="%.2f", width='small'),
+            'Mpy': st.column_config.NumberColumn("Mp en Y", min_value=0.0, step=0.01, format="%.2f", width='small'),
+            'Vux': st.column_config.NumberColumn("Vu en X", min_value=0.0, step=0.01, format="%.2f", width='small'),
+            'Vuy': st.column_config.NumberColumn("Vu en Y", min_value=0.0, step=0.01, format="%.2f", width='small'),
         },
         use_container_width=True,
         hide_index=True,
@@ -1002,15 +1045,45 @@ tie_table = st.session_state.get('tie_beams_table', [])
 fig_pre = draw_preliminary_plot(design_entities, cl, tie_table)
 st.plotly_chart(fig_pre, use_container_width=True)
 
+# ── Sprint A2 Fase 6: Nota sobre zapatas combinadas ──────────────────────────
+# Si ya existe un resultado de diseño con zapatas combinadas, mostrar a qué
+# nudo combinado pertenece cada columna, para que el usuario sepa que al
+# seleccionar J5 como destino de viga, el enlace irá a ZC-01 (que contiene J5+J8).
+_prev_final = (st.session_state.get('results') or {}).get('final_footings', [])
+_combined_map = {}   # joint_str → footing_id  (solo zapatas combinadas)
+for _f in _prev_final:
+    if _f.get('type') == 'combined':
+        for _jj in _f.get('joint', '').split('+'):
+            _jj = _jj.strip()
+            if _jj:
+                _combined_map[_jj] = _f['id']
+
+if _combined_map:
+    _comb_lines = []
+    for _fid in sorted(set(_combined_map.values())):
+        _joints_in = sorted(j for j, fid in _combined_map.items() if fid == _fid)
+        _comb_lines.append(f"**{_fid}**: " + " + ".join(f"J{j}" for j in _joints_in))
+    st.info(
+        "ℹ️ **Zapatas combinadas del último diseño** — al seleccionar un nudo destino que "
+        "pertenece a una combinada, la viga de enlace se conectará a esa zapata completa:\n\n" +
+        "  \n".join(_comb_lines)
+    )
+
 # ── Tabla editable de vigas ──
 st.subheader("Conexiones de vigas de enlace")
 if tie_table:
-    st.caption("Modifique las conexiones propuestas o elimine cambiando a 'Ninguno'. Puede agregar vigas manuales abajo.")
+    st.caption("Modifique las conexiones o marque **🗑️ Eliminar** para quitar una fila. Puede agregar vigas abajo.")
 else:
     st.caption("No se proponen vigas automáticas. Puede agregar vigas manuales abajo.")
 
 if tie_table:
-    df_ties = pd.DataFrame(tie_table)
+    # Añadir columna Eliminar si no existe
+    _tie_rows_display = []
+    for _r in tie_table:
+        _tr = dict(_r)
+        _tr.setdefault('Eliminar', False)
+        _tie_rows_display.append(_tr)
+    df_ties = pd.DataFrame(_tie_rows_display)
     tie_key = f"tie_editor_{st.session_state.get('tie_version', 0)}"
     edited_ties = st.data_editor(
         df_ties,
@@ -1021,11 +1094,12 @@ if tie_table:
             'Conecta_Y': st.column_config.SelectboxColumn(
                 "Conecta en Y", options=node_options, required=True, width='small'),
             'Origen': st.column_config.TextColumn(disabled=True, width='small'),
+            'Eliminar': st.column_config.CheckboxColumn("🗑️", width='small'),
         },
         use_container_width=True, hide_index=True, key=tie_key,
     )
 else:
-    edited_ties = pd.DataFrame(columns=['Nodo', 'Conecta_X', 'Conecta_Y', 'Origen'])
+    edited_ties = pd.DataFrame(columns=['Nodo', 'Conecta_X', 'Conecta_Y', 'Origen', 'Eliminar'])
 
 # ── Agregar viga manual ──
 st.subheader("➕ Agregar viga manual")
@@ -1074,10 +1148,12 @@ with ac4:
 # ── Botón APLICAR vigas ──
 st.divider()
 if st.button("✅ Aplicar vigas y actualizar gráfico", type="primary", use_container_width=True):
-    # Leer la tabla editada
+    # Leer la tabla editada; descartar filas marcadas con Eliminar=True
     final_tie_rows = []
     if not edited_ties.empty:
         for _, row in edited_ties.iterrows():
+            if row.get('Eliminar', False):
+                continue   # fila marcada para borrar → se omite
             final_tie_rows.append({
                 'Nodo': row['Nodo'],
                 'Conecta_X': row['Conecta_X'],
@@ -1164,16 +1240,29 @@ if conv:
 
 # ── Tabla editable de verificación ──
 with st.expander("✏️ Modificar dimensiones y re-verificar", expanded=False):
-    st.caption("Modifique B, L, h para cualquier zapata y presione 'Re-verificar'. "
-               "Las zapatas combinadas se muestran pero sus dimensiones se recalculan automáticamente.")
+    st.caption(
+        "Modifique B, L, h y presione **Re-verificar**. "
+        "Las zapatas con **🔒** en B o L tienen esa dimensión bloqueada por linderos y no pueden modificarse. "
+        "Las marcadas con **📌** tienen una cara libre: la modificación se aplica desde el lindero fijo."
+    )
     verify_rows = []
     for f in final:
         is_comb = f.get('type') == 'combined'
+        cc = f.get('combined_constraints', {}) if is_comb else {}
+        locked_B = cc.get('locked_B', False)
+        locked_L = cc.get('locked_L', False)
+        pinned_x = cc.get('pinned_x', False)
+        pinned_y = cc.get('pinned_y', False)
+        # Etiqueta de restricción
+        rest_b = '🔒 bloqueada' if locked_B else ('📌 una cara' if pinned_x else '↔ libre')
+        rest_l = '🔒 bloqueada' if locked_L else ('📌 una cara' if pinned_y else '↔ libre')
         verify_rows.append({
             'ID': f['id'],
             'Tipo': f.get('type', '?')[:5],
             'B': f['B'],
+            'Rest. B': rest_b,
             'L': f['L'],
+            'Rest. L': rest_l,
             'h': f['h'],
             'Estado': f['st'],
         })
@@ -1182,21 +1271,34 @@ with st.expander("✏️ Modificar dimensiones y re-verificar", expanded=False):
     edited_dims = st.data_editor(
         df_verify,
         column_config={
-            'ID': st.column_config.TextColumn(disabled=True, width='small'),
-            'Tipo': st.column_config.TextColumn(disabled=True, width='small'),
-            'B': st.column_config.NumberColumn(min_value=0.30, step=0.05, format="%.2f"),
-            'L': st.column_config.NumberColumn(min_value=0.30, step=0.05, format="%.2f"),
-            'h': st.column_config.NumberColumn(min_value=0.20, step=0.05, format="%.2f"),
+            'ID':     st.column_config.TextColumn(disabled=True, width='small'),
+            'Tipo':   st.column_config.TextColumn(disabled=True, width='small'),
+            'B':      st.column_config.NumberColumn(min_value=0.30, step=0.05, format="%.2f"),
+            'Rest. B':st.column_config.TextColumn(disabled=True, width='small'),
+            'L':      st.column_config.NumberColumn(min_value=0.30, step=0.05, format="%.2f"),
+            'Rest. L':st.column_config.TextColumn(disabled=True, width='small'),
+            'h':      st.column_config.NumberColumn(min_value=0.20, step=0.05, format="%.2f"),
             'Estado': st.column_config.TextColumn(disabled=True, width='small'),
         },
         use_container_width=True, hide_index=True, key=ver_key,
     )
     if st.button("🔄 Re-verificar con dimensiones modificadas", type="secondary", use_container_width=True):
         user_dims = {}
+        # Build lookup: footing id → combined_constraints (for combined footings)
+        _cc_map = {f['id']: f.get('combined_constraints', {}) for f in final if f.get('type') == 'combined'}
         for _, row in edited_dims.iterrows():
-            fid = row['ID']
-            if row['Tipo'][:5] != 'combi':  # Solo aisladas
-                user_dims[fid] = {'B': float(row['B']), 'L': float(row['L']), 'h': float(row['h'])}
+            fid = str(row['ID'])
+            cc_row = _cc_map.get(fid, {})
+            B_usr = float(row['B']); L_usr = float(row['L']); h_usr = float(row['h'])
+            if row['Tipo'][:5] == 'combi':
+                # Para combined: respetar bloqueos de lindero
+                user_dims[fid] = {
+                    'B': B_usr if not cc_row.get('locked_B') else None,
+                    'L': L_usr if not cc_row.get('locked_L') else None,
+                    'h': h_usr,
+                }
+            else:
+                user_dims[fid] = {'B': B_usr, 'L': L_usr, 'h': h_usr}
         tie_table_final = st.session_state.get('tie_beams_table', [])
         user_ties = table_to_ties_dict(tie_table_final, design_entities)
         with st.spinner("Re-verificando con dimensiones del usuario..."):
@@ -1413,8 +1515,10 @@ with tab_vigas_res:
     else:
         rows = []
         for sys in valid_sys:
+            _tipo = '🔗 intra' if sys.get('intra_combined') else '↔ enlace'
             rows.append({
                 'Sistema': sys['system_id'],
+                'Tipo': _tipo,
                 'Dir': sys['direction'],
                 'Zapatas': ', '.join(sys.get('footings', [])),
                 'Nodos': sys['num_nodes'],
@@ -1474,13 +1578,54 @@ with tab_audit:
         if cc.get('has_corner_constraint'): parts.append(f"Esquinas: {cc.get('corners', [])}")
         if parts:
             st.warning(f"⚠️ Restricciones heredadas: {' | '.join(parts)}")
+        # Mostrar estado de bloqueo dimensional
+        _lock_msgs = []
+        if cc.get('locked_B'):
+            lp = cc.get('left_pin'); rp = cc.get('right_pin')
+            _lock_msgs.append(f"🔒 **B bloqueada** por linderos X— y X+ (B fija = {round(rp-lp,2) if lp and rp else '?'}m). No se puede ampliar.")
+        if cc.get('locked_L'):
+            bp = cc.get('bot_pin'); tp = cc.get('top_pin')
+            _lock_msgs.append(f"🔒 **L bloqueada** por linderos Y— y Y+ (L fija = {round(tp-bp,2) if bp and tp else '?'}m). No se puede ampliar.")
+        if not cc.get('locked_B') and cc.get('pinned_x'):
+            _lock_msgs.append(f"📌 B anclada en una cara — modificación se aplica hacia el lado libre.")
+        if not cc.get('locked_L') and cc.get('pinned_y'):
+            _lock_msgs.append(f"📌 L anclada en una cara — modificación se aplica hacia el lado libre.")
+        for _lm in _lock_msgs:
+            st.info(_lm)
         cont = sf.get('containment', {})
         if cont.get('details'):
             not_ok = [d for d in cont['details'] if not d['contained']]
             if not_ok:
-                st.error(f"❌ Columnas NO contenidas: {', '.join('J'+d['joint'] for d in not_ok)}")
+                st.error(f"❌ Columnas NO contenidas (linderos impiden expansión): "
+                         f"{', '.join('J'+d['joint'] for d in not_ok)}")
             else:
                 st.success(f"✅ Todas las columnas contenidas")
+
+    # Jerarquía de dimensiones (zapatas combinadas)
+    _hcheck = sf.get('hierarchy_check')
+    if sf.get('type') == 'combined' and _hcheck:
+        st.divider()
+        st.subheader("📐 Jerarquía de dimensiones")
+        _hc1, _hc2 = st.columns(2)
+        _hc1.metric("B mín. por columnas aisladas", f"{_hcheck.get('B_min_hier', '?')} m",
+                    delta=f"{round(sf['B'] - _hcheck.get('B_min_hier', sf['B']), 3):+.3f} m vs actual")
+        _hc2.metric("L mín. por columnas aisladas", f"{_hcheck.get('L_min_hier', '?')} m",
+                    delta=f"{round(sf['L'] - _hcheck.get('L_min_hier', sf['L']), 3):+.3f} m vs actual")
+        _b_isos = _hcheck.get('B_iso_list', [])
+        _l_isos = _hcheck.get('L_iso_list', [])
+        if _b_isos:
+            st.caption(f"B por columna: {' / '.join(f'{v}m' for v in _b_isos)}  →  max = {_hcheck.get('B_min_hier')}m")
+        if _l_isos:
+            st.caption(f"L por columna: {' / '.join(f'{v}m' for v in _l_isos)}  →  max = {_hcheck.get('L_min_hier')}m")
+        if _hcheck.get('ok'):
+            st.success("✅ Dimensiones de zapata combinada satisfacen jerarquía de columnas aisladas.")
+        else:
+            if _hcheck.get('resized'):
+                st.warning(f"🔄 Zapata redimensionada por jerarquía: "
+                           f"B {_hcheck.get('B_before','?')} → {sf['B']} m, "
+                           f"L {_hcheck.get('L_before','?')} → {sf['L']} m")
+            else:
+                st.error("⚠️ Dimensiones por debajo del mínimo jerárquico (linderos bloquean expansión).")
 
     # Sistemas enlazados
     sys_list = results.get('tie_systems', [])
@@ -1794,6 +1939,425 @@ with tab_audit_v:
                     st.plotly_chart(fig_as, use_container_width=True)
             else:
                 st.info("Diagramas V-M no disponibles para este sistema.")
+
+        # ── Nota intra-combinada ──
+        if sd.get('intra_combined'):
+            st.info(f"ℹ️ {sd.get('note', 'Sistema intra-combinado — análisis longitudinal de la zapata.')}")
+
+        # ── Exportar modelo analítico S2K de este sistema ──
+        st.divider()
+        st.subheader("📤 Exportar modelo analítico de viga")
+        _s2k_sys_key = f"s2k_sys_{sd['system_id']}"
+
+        def _gen_s2k_for_system(sys_data, final_footings_list, params_d, sap_units_str,
+                                jloads_d, combos_d, lp_d):
+            """
+            Genera un .$2k 1D completo para el sistema de viga de enlace.
+            Todos los nudos se proyectan sobre el eje de la viga (modelo 1D estricto).
+            - Cargas en nudos de columna (posición proyectada en eje).
+            - Apoyos en centroide de zapata (posición proyectada en eje).
+            - Zapata combinada intra-combinada → apoyo FIJO (clamp) para estabilidad.
+            - Viga inter-zapatas → apoyo PIN (solo traslaciones).
+            - Tabla FRAME SECTION ASSIGNMENTS separada de CONNECTIVITY - FRAME.
+            """
+            direction  = sys_data.get('direction', 'X')
+            sys_id     = sys_data.get('system_id', 'SYS')
+            b_v        = float(sys_data.get('b_viga', 0.30))
+            h_v        = float(sys_data.get('h_viga', 0.50))
+            fc_mpa     = float(params_d.get('fc', 21))
+            gc_kn      = float(params_d.get('gamma_c', 24.0))   # kN/m³ peso concreto
+            intra_comb = bool(sys_data.get('intra_combined', False))
+            sec_name   = f"VE_{int(round(b_v*100))}x{int(round(h_v*100))}"
+            mat_name   = f"CONC_{int(round(fc_mpa))}MPa"
+
+            # ── Geometría: usar datos ya proyectados de analyze_tie_system ────
+            geom       = sys_data.get('geometry', {})
+            load_nodes = geom.get('loads', [])   # [{fid, x_load, x_sup, ecc, coalesced}]
+            jnds_per   = sys_data.get('joints', [])  # ['J1', 'J3,J2', ...] — por nodo
+
+            if not load_nodes:
+                return None, "Geometría del sistema no disponible (sin nodos de carga)."
+
+            # Aplanar joint strings (pueden ser 'J1,J2' para combined nodes)
+            def _flat(s):
+                return [j.strip() for j in str(s).split(',') if j.strip()]
+
+            all_j_flat = []
+            for _js in jnds_per:
+                all_j_flat.extend(_flat(_js))
+
+            # ── Mapa fid → zapata (para peso propio de zapatas en caso SW) ──────
+            f_fmap = {_f.get('id', ''): _f for _f in final_footings_list}
+
+            # ── Coordenada perpendicular del eje (fija para todo el modelo) ──
+            j2col_map = {}
+            for _f in final_footings_list:
+                for _c in _f.get('cols', []):
+                    j2col_map[str(_c['joint'])] = _c
+            perp_vals = []
+            for _j in all_j_flat:
+                _c = j2col_map.get(_j)
+                if _c:
+                    perp_vals.append(_c['y'] if direction == 'X' else _c['x'])
+            beam_perp = round(sum(perp_vals) / len(perp_vals), 5) if perp_vals else 0.0
+
+            # ── Registro de nudos 1D (todos sobre el eje de la viga) ─────────
+            _pt_map  = {}    # axis_pos → sap_jid
+            _pt_list = []    # [(x, y, z, sap_jid)]
+            _jcnt    = [1]
+
+            def _get_jnt(axis_pos):
+                """Retorna (crea si es nuevo) un nudo SAP en la posición del eje."""
+                ap = round(float(axis_pos), 5)
+                if ap not in _pt_map:
+                    _jid = str(_jcnt[0]); _jcnt[0] += 1
+                    _pt_map[ap] = _jid
+                    if direction == 'X':
+                        _pt_list.append((ap, beam_perp, 0.0, _jid))
+                    else:
+                        _pt_list.append((beam_perp, ap, 0.0, _jid))
+                return _pt_map[ap]
+
+            # Crear nudos de carga y apoyo por nodo
+            load_jnt_by_node = [_get_jnt(ln['x_load']) for ln in load_nodes]
+            sup_jnt_by_node  = [_get_jnt(ln['x_sup'])  for ln in load_nodes]
+            unique_sup_jnts  = list(dict.fromkeys(sup_jnt_by_node))
+
+            # ── Elementos de viga ─────────────────────────────────────────────
+            # Tramos: conectar posiciones de apoyo únicas y ordenadas
+            sup_axes = sorted(set(round(float(ln['x_sup']), 5) for ln in load_nodes))
+            frames_conn = []   # [(jnt_i, jnt_j)]
+            for _i in range(len(sup_axes) - 1):
+                _jA = _get_jnt(sup_axes[_i])
+                _jB = _get_jnt(sup_axes[_i+1])
+                if _jA != _jB:
+                    frames_conn.append((_jA, _jB))
+
+            # Brazos excéntricos: nudo-carga → nudo-apoyo (cuando ecc > 0)
+            _arm_done = set()
+            for _i, ln in enumerate(load_nodes):
+                if not ln.get('coalesced', True) and abs(ln.get('ecc', 0)) > 1e-4:
+                    _jld = load_jnt_by_node[_i]
+                    _jsp = sup_jnt_by_node[_i]
+                    if _jld != _jsp:
+                        _pair = tuple(sorted([_jld, _jsp]))
+                        if _pair not in _arm_done:
+                            frames_conn.append((_jld, _jsp))
+                            _arm_done.add(_pair)
+
+            if not frames_conn:
+                # Si todos coalesced en un punto, hacer al menos un elemento ficticio
+                all_axes = sorted(_pt_map.keys())
+                if len(all_axes) >= 2:
+                    frames_conn.append((_get_jnt(all_axes[0]), _get_jnt(all_axes[-1])))
+                else:
+                    return None, "Sistema con un único punto — no se puede generar viga."
+
+            # ── Patrones de carga ─────────────────────────────────────────────
+            _pats_raw = [p for p in sys_data.get('patterns_resolved', []) if p != 'PP_VIGA']
+            if not _pats_raw:
+                for _j in all_j_flat:
+                    if _j in jloads_d:
+                        _pats_raw = sorted(jloads_d[_j].keys()); break
+            _design_type = {
+                'D':'Dead','SD':'Superimposed Dead','L':'Live','Lr':'Roof Live',
+                'Le':'Live','S':'Snow','W':'Wind','E':'Seismic',
+                'Sx':'Seismic','Sy':'Seismic',
+                'Wx+':'Wind','Wx-':'Wind','Wy+':'Wind','Wy-':'Wind',
+            }
+            for _pk, _pv in (lp_d or {}).items():
+                if _pk not in _design_type:
+                    _t = str(_pv).lower() if isinstance(_pv, str) else ''
+                    if   'dead'  in _t: _design_type[_pk] = 'Dead'
+                    elif 'live'  in _t: _design_type[_pk] = 'Live'
+                    elif 'seism' in _t or 'quake' in _t: _design_type[_pk] = 'Seismic'
+                    elif 'wind'  in _t: _design_type[_pk] = 'Wind'
+                    else:               _design_type[_pk] = 'Other'
+            _pats = _pats_raw or ['D', 'L']
+
+            # ── Helpers ───────────────────────────────────────────────────────
+            def _fv(v):
+                if isinstance(v, bool): return "Yes" if v else "No"
+                if isinstance(v, int):  return str(v)
+                if isinstance(v, float):
+                    v = 0.0 if abs(v) < 1e-12 else v
+                    t = f"{v:.6f}".rstrip('0').rstrip('.')
+                    return t if t else "0"
+                return str(v)
+
+            _tbl = {}
+            def _add(tname, **kwargs):
+                _tbl.setdefault(tname, []).append(
+                    "   ".join(f"{k}={_fv(v)}" for k, v in kwargs.items()))
+
+            # ── PROGRAM CONTROL ───────────────────────────────────────────────
+            _add("PROGRAM CONTROL",
+                 ProgramName="SAP2000", Version=26,
+                 CurrUnits=f'"{sap_units_str}"',
+                 SteelCode='"AISC 360-10"',
+                 ConcCode='"ACI 318-08/IBC2009"',
+                 RegenHinge="Yes")
+
+            # ── LOAD PATTERN DEFINITIONS ──────────────────────────────────────
+            for _p in _pats:
+                _add("LOAD PATTERN DEFINITIONS",
+                     LoadPat=f'"{_p}"',
+                     DesignType=f'"{_design_type.get(_p,"Other")}"',
+                     SelfWtMult=0, AutoLoad="None")
+            # SW — peso propio de la viga + peso de zapatas (SelfWtMult=1 para
+            # que SAP calcule automáticamente el peso propio de los elementos)
+            _add("LOAD PATTERN DEFINITIONS",
+                 LoadPat='"SW"', DesignType='"Dead"',
+                 SelfWtMult=1, AutoLoad="None")
+
+            # ── LOAD CASE DEFINITIONS ─────────────────────────────────────────
+            for _p in _pats:
+                _add("LOAD CASE DEFINITIONS",
+                     Case=f'"{_p}"', Type="LinStatic",
+                     InitialCond="Zero",
+                     DesignType=f'"{_design_type.get(_p,"Other")}"',
+                     RunCase="Yes")
+            _add("LOAD CASE DEFINITIONS",
+                 Case='"SW"', Type="LinStatic",
+                 InitialCond="Zero", DesignType='"Dead"', RunCase="Yes")
+
+            # ── CASE - STATIC 1 - LOAD ASSIGNMENTS ───────────────────────────
+            for _p in _pats:
+                _add("CASE - STATIC 1 - LOAD ASSIGNMENTS",
+                     Case=f'"{_p}"', LoadType='"Load pattern"',
+                     LoadName=f'"{_p}"', LoadSF=1)
+            _add("CASE - STATIC 1 - LOAD ASSIGNMENTS",
+                 Case='"SW"', LoadType='"Load pattern"',
+                 LoadName='"SW"', LoadSF=1)
+
+            # ── MATERIAL ──────────────────────────────────────────────────────
+            _E = 4700.0 * math.sqrt(fc_mpa)
+            _add("MATERIAL PROPERTIES 01 - GENERAL",
+                 Material=f'"{mat_name}"', Type="Concrete",
+                 SymType="Isotropic", TempDepend="No", Color="Cyan")
+            _add("MATERIAL PROPERTIES 02 - BASIC MECHANICAL PROPERTIES",
+                 Material=f'"{mat_name}"', E1=_E, U12=0.2,
+                 A1=9.9e-6,
+                 UnitMass=round(gc_kn / 9.81, 5),
+                 UnitWeight=gc_kn)
+            _add("MATERIAL PROPERTIES 03B - CONCRETE DATA",
+                 Material=f'"{mat_name}"', Fc=fc_mpa*10.1972,
+                 LtWtConc="No", FcsFactor=1,
+                 SSType="Parametric-Simple", SSHysType="Takeda",
+                 StrainAtFc=0.002219, StrainUltimate=0.005, FinalSlope=0)
+
+            # ── FRAME SECTION ─────────────────────────────────────────────────
+            _area = b_v * h_v
+            _I33  = b_v * h_v**3 / 12
+            _I22  = h_v * b_v**3 / 12
+            _J    = min(b_v, h_v) * max(b_v, h_v)**3 / 3 * 0.2
+            _AS   = max(0.833 * _area, 1e-6)
+            _add("FRAME SECTION PROPERTIES 01 - GENERAL",
+                 SectionName=f'"{sec_name}"', Material=f'"{mat_name}"',
+                 Shape="Rectangular", t3=h_v, t2=b_v,
+                 Area=_area, TorsConst=_J, I33=_I33, I22=_I22, I23=0.0,
+                 AS2=_AS, AS3=_AS,
+                 AMod=1, A2Mod=1, A3Mod=1, JMod=1, I2Mod=1, I3Mod=1, MMod=1, WMod=1)
+            _add("FRAME SECTION PROPERTIES 03 - CONCRETE BEAM",
+                 SectionName=f'"{sec_name}"',
+                 RebarMatL="A706Gr60", RebarMatC="A706Gr60",
+                 TopCover=0.04, BotCover=0.04,
+                 TopLeftArea=0, TopRghtArea=0, BotLeftArea=0, BotRghtArea=0)
+
+            # ── JOINT COORDINATES (1D — todos en el eje de la viga) ───────────
+            for (_x, _y, _z, _jid) in _pt_list:
+                _add("JOINT COORDINATES",
+                     Joint=_jid, CoordSys="GLOBAL", CoordType="Cartesian",
+                     XorR=_x, Y=_y, Z=_z)
+
+            # ── JOINT RESTRAINTS ──────────────────────────────────────────────
+            # intra_combined → FIJO completo (clamp): estabilidad con un solo apoyo.
+            # inter-zapata (dir X):
+            #   R2 = No  → libre en flexión principal (plano XZ, momento M2)
+            #   R1 = Yes → fijo torsión/plano perp. (captura momentos M1 de columnas)
+            #   R3 = Yes → fijo rotación horizontal (estabilidad)
+            # inter-zapata (dir Y):
+            #   R1 = No  → libre en flexión principal (plano YZ, momento M1)
+            #   R2 = Yes → fijo plano perp. (captura momentos M2 de columnas)
+            #   R3 = Yes → fijo rotación horizontal (estabilidad)
+            if intra_comb:
+                _R1, _R2, _R3 = "Yes", "Yes", "Yes"
+            elif direction == 'X':
+                _R1, _R2, _R3 = "Yes", "No", "Yes"
+            else:  # direction == 'Y'
+                _R1, _R2, _R3 = "No", "Yes", "Yes"
+            _rest_done = set()
+            for _sjid in unique_sup_jnts:
+                if _sjid not in _rest_done:
+                    _add("JOINT RESTRAINT ASSIGNMENTS",
+                         Joint=_sjid, U1="Yes", U2="Yes", U3="Yes",
+                         R1=_R1, R2=_R2, R3=_R3)
+                    _rest_done.add(_sjid)
+
+            # ── CONNECTIVITY - FRAME (solo conectividad, sin sección aquí) ───
+            for _fi_idx, (_jI, _jJ) in enumerate(frames_conn):
+                _add("CONNECTIVITY - FRAME",
+                     Frame=_fi_idx+1, JointI=_jI, JointJ=_jJ)
+
+            # ── FRAME SECTION ASSIGNMENTS (sección separada) ──────────────────
+            for _fi_idx in range(len(frames_conn)):
+                _add("FRAME SECTION ASSIGNMENTS",
+                     Frame=_fi_idx+1,
+                     AutoSelect='"N.A."',
+                     AnalSect=f'"{sec_name}"',
+                     MatProp='"Default"')
+
+            # ── JOINT LOADS - FORCE (per patrón, por nodo de carga) ───────────
+            # Se aplican AMBOS momentos M1 y M2 en cada nudo de carga:
+            #   - El momento en la dirección de la viga → flexión principal del modelo
+            #   - El momento perpendicular → capturado por el apoyo con R fijo,
+            #     permite auditar el efecto transversal sobre la zapata.
+            _jld_added = False
+            for _pat in _pats:
+                for _ni, ln in enumerate(load_nodes):
+                    _jld_sap = load_jnt_by_node[_ni]
+                    _nj = _flat(jnds_per[_ni] if _ni < len(jnds_per) else '')
+                    _Fz = sum(abs(float(jloads_d.get(_j, {}).get(_pat, {}).get('F3', 0)))
+                              for _j in _nj)
+                    _m2v = sum(float(jloads_d.get(_j, {}).get(_pat, {}).get('M2', 0))
+                               for _j in _nj)
+                    _m1v = sum(float(jloads_d.get(_j, {}).get(_pat, {}).get('M1', 0))
+                               for _j in _nj)
+                    if abs(_Fz) > 0.01 or abs(_m1v) > 0.01 or abs(_m2v) > 0.01:
+                        _add("JOINT LOADS - FORCE",
+                             Joint=_jld_sap, LoadPat=f'"{_pat}"',
+                             CoordSys="GLOBAL",
+                             F1=0.0, F2=0.0, F3=-_Fz,
+                             M1=_m1v, M2=_m2v, M3=0.0)
+                        _jld_added = True
+
+            # ── JOINT LOADS - FORCE: peso propio de zapatas (patrón SW) ─────────
+            # Cada apoyo recibe la carga puntual del volumen de su zapata.
+            # El peso propio de la viga lo calcula SAP con SelfWtMult=1 en SW.
+            _fids_sw_done = set()
+            for _ni, ln in enumerate(load_nodes):
+                _fid_sw = ln.get('fid', '')
+                if _fid_sw in _fids_sw_done:
+                    continue          # zapata ya procesada (nodos compartidos)
+                _fids_sw_done.add(_fid_sw)
+                _fobj_sw = f_fmap.get(_fid_sw)
+                if _fobj_sw:
+                    _Wf = gc_kn * _fobj_sw.get('B', 0) * _fobj_sw.get('L', 0) * _fobj_sw.get('h', 0)
+                    if _Wf > 0.01:
+                        _jsp_sw = sup_jnt_by_node[_ni]
+                        _add("JOINT LOADS - FORCE",
+                             Joint=_jsp_sw, LoadPat='"SW"',
+                             CoordSys="GLOBAL",
+                             F1=0.0, F2=0.0, F3=-_Wf,
+                             M1=0.0, M2=0.0, M3=0.0)
+                        _jld_added = True
+
+            if not _jld_added:
+                _tbl.setdefault("JOINT LOADS - FORCE", []).append(
+                    '$ (sin cargas en patrones definidos)')
+
+            # ── COMBINATION DEFINITIONS ───────────────────────────────────────
+            _pats_set  = set(_pats)
+            _ads_names = []; _lrfd_names = []
+
+            def _add_combo(cname, factors, ctype="Linear Add"):
+                # SW se suma con el mismo factor que D en cada combinación
+                # (SW representa el peso propio de la viga + volumen de zapatas)
+                _ext = dict(factors)
+                if 'D' in _ext:
+                    _ext['SW'] = _ext['D']
+                _items = [(p, sf) for p, sf in _ext.items()
+                          if p in _pats_set or p == 'SW']
+                if not _items: return False
+                for _k, (_p, _sf) in enumerate(_items):
+                    if _k == 0:
+                        _add("COMBINATION DEFINITIONS",
+                             ComboName=f'"{cname}"', ComboType=f'"{ctype}"',
+                             AutoDesign="No", CaseName=f'"{_p}"', ScaleFactor=_sf)
+                    else:
+                        _add("COMBINATION DEFINITIONS",
+                             ComboName=f'"{cname}"', CaseName=f'"{_p}"',
+                             ScaleFactor=_sf)
+                return True
+
+            def _add_envelope(envname, members):
+                for _k, _m in enumerate(members):
+                    if _k == 0:
+                        _add("COMBINATION DEFINITIONS",
+                             ComboName=f'"{envname}"', ComboType='"Envelope"',
+                             AutoDesign="No", CaseName=f'"{_m}"', ScaleFactor=1)
+                    else:
+                        _add("COMBINATION DEFINITIONS",
+                             ComboName=f'"{envname}"', CaseName=f'"{_m}"',
+                             ScaleFactor=1)
+
+            if combos_d:
+                for _c in combos_d.get('ADS', []):
+                    if _add_combo(_c['name'], _c['factors']): _ads_names.append(_c['name'])
+                for _c in combos_d.get('LRFD', []):
+                    if _add_combo(_c['name'], _c['factors']): _lrfd_names.append(_c['name'])
+                if _ads_names:  _add_envelope("ENV_ASD",  _ads_names)
+                if _lrfd_names: _add_envelope("ENV_LRFD", _lrfd_names)
+
+            # ── Ensamblar texto final ─────────────────────────────────────────
+            _out = [f'$ SAP2000 .$2k — Viga de enlace: {sys_id}',
+                    '$ Generado por Cimentaciones App (NSR-10)',
+                    f'$ Dirección: {direction}  |  Intra-combinada: {"Sí (apoyo fijo)" if intra_comb else "No (apoyo pin)"}',
+                    f'$ Apoyos: U1=U2=U3=Yes  R1={_R1}  R2={_R2}  R3={_R3}',
+                    f'$ SW: SelfWtMult=1 (peso viga auto) + pesos zapata en apoyos.',
+                    f'$ Momentos M1 y M2 aplicados en todos los nudos de carga.',
+                    '']
+            _order = [
+                "PROGRAM CONTROL",
+                "LOAD PATTERN DEFINITIONS",
+                "LOAD CASE DEFINITIONS",
+                "CASE - STATIC 1 - LOAD ASSIGNMENTS",
+                "MATERIAL PROPERTIES 01 - GENERAL",
+                "MATERIAL PROPERTIES 02 - BASIC MECHANICAL PROPERTIES",
+                "MATERIAL PROPERTIES 03B - CONCRETE DATA",
+                "FRAME SECTION PROPERTIES 01 - GENERAL",
+                "FRAME SECTION PROPERTIES 03 - CONCRETE BEAM",
+                "JOINT COORDINATES",
+                "JOINT RESTRAINT ASSIGNMENTS",
+                "CONNECTIVITY - FRAME",
+                "FRAME SECTION ASSIGNMENTS",
+                "JOINT LOADS - FORCE",
+                "COMBINATION DEFINITIONS",
+            ]
+            for _tname in _order:
+                if _tname not in _tbl or not _tbl[_tname]: continue
+                _out.append(f'TABLE:  "{_tname}"')
+                for _row in _tbl[_tname]:
+                    _out.append(f'   {_row}')
+                _out.append('')
+            _out.append('END TABLE DATA')
+            return '\n'.join(_out), None
+
+        _btn_s2k_sys = st.button(
+            f"🏗️ Generar S2K del sistema **{sd['system_id']}**",
+            key=f"btn_gen_s2k_{sd['system_id']}", use_container_width=True)
+        if _btn_s2k_sys:
+            _jloads_sys  = results.get('export_jloads', md.get('_jloads', {}))
+            _combos_sys  = __import__('parser').gen_combos(md.get('_cl', {}), R=params.get('R', 1.0))
+            _lp_sys      = md.get('_lp', {})
+            _s2k_txt, _s2k_err = _gen_s2k_for_system(
+                sd, final, params, sap_units,
+                _jloads_sys, _combos_sys, _lp_sys)
+            if _s2k_err:
+                st.error(_s2k_err)
+            else:
+                st.session_state[_s2k_sys_key] = _s2k_txt
+                st.success("Modelo S2K generado.")
+
+        if st.session_state.get(_s2k_sys_key):
+            st.download_button(
+                f"📥 Descargar {sd['system_id']}.$2k",
+                data=st.session_state[_s2k_sys_key],
+                file_name=f"{sd['system_id']}.$2k",
+                mime="text/plain",
+                key=f"dl_s2k_{sd['system_id']}",
+                use_container_width=True,
+            )
 
 # ════════════════════════════════════════════════
 # TAB: EXPORTAR

@@ -193,13 +193,27 @@ def calc_as(Mu, b, d, fc, fy, phi_f=0.9):
 # ================================================================
 # OPTIMIZACIÓN AISLADA (menor volumen)
 # ================================================================
-def optimize_isolated(col, ads_f, lrfd_f, params, classification):
+def optimize_isolated(col, ads_f, lrfd_f, params, classification, tied_dirs=None):
     jid = col['joint']; cx = col['x']; cy = col['y']; bx = col['bx']; by = col['by']
     fc = params['fc']; fy = params['fy']; rec = params['rec']
     gc = params['gamma_c']; gs = params['gamma_s']; Df = params['Df']
     hmin = params['h_min']; dmin = params.get('dim_min', 0.60)
     qmap = {'q1': params['qadm_1'], 'q2': params['qadm_2'], 'q3': params['qadm_3']}
     margin_borde = 0.05
+    # Zero moments in directions restrained by tie beams so the optimizer
+    # doesn't penalize eccentricity in the tied direction.
+    if tied_dirs:
+        def _ztm(fd):
+            out = {}
+            for cn, fv in fd.items():
+                nf = dict(fv)
+                if 'X' in tied_dirs: nf['My'] = 0.0   # X-beam restrains My (eccentricity in X)
+                if 'Y' in tied_dirs: nf['Mx'] = 0.0   # Y-beam restrains Mx (eccentricity in Y)
+                out[cn] = nf
+            return out
+        ads_f = _ztm(ads_f)
+        lrfd_f = _ztm(lrfd_f)
+
     loc = classification.get('location', 'concentrica')
     side = classification.get('side', ''); corner = classification.get('corner', '')
     ecc_x = classification.get('ecc_x', 0); ecc_y = classification.get('ecc_y', 0); ecc_dir = classification.get('ecc_dir', 'ambas')
@@ -273,7 +287,7 @@ def optimize_isolated(col, ads_f, lrfd_f, params, classification):
 # ================================================================
 # DISEÑO ESTRUCTURAL COMPLETO (dimensiones fijas)
 # ================================================================
-def full_structural_design(jid, x, y, B, L, h, col_bx, col_by, ads_f, lrfd_f, params, column_forces=None):
+def full_structural_design(jid, x, y, B, L, h, col_bx, col_by, ads_f, lrfd_f, params, column_forces=None, tied_dirs=None):
     """Auditoría ADS + LRFD completa. Incluye FS volcamiento y deslizamiento."""
     fc = params['fc']; fy = params['fy']; rec = params['rec']
     gc = params['gamma_c']; gs = params['gamma_s']; Df = params['Df']
@@ -282,6 +296,23 @@ def full_structural_design(jid, x, y, B, L, h, col_bx, col_by, ads_f, lrfd_f, pa
     fs_desl_min_p = params.get('fs_desl_min', {'q1': 1.5, 'q2': 1.2, 'q3': 1.2})
     qmap = {'q1': params['qadm_1'], 'q2': params['qadm_2'], 'q3': params['qadm_3']}
     A = B * L; Wf = gc * A * h; Ws = gs * A * (Df - h); Wt = Wf + Ws; d = h - rec - 0.016; d = max(d, 0.10)
+
+    # Zero moments in directions restrained by tie beams.
+    # Tie in X → beam along X restrains My (eccentricity in X) → My = 0.
+    # Tie in Y → beam along Y restrains Mx (eccentricity in Y) → Mx = 0.
+    # Zeroing Mx/My naturally propagates: soil_pressure → ex/ey = 0,
+    # overturning_check → fs_volc_x or fs_volc_y = 999 (not critical).
+    if tied_dirs:
+        def _ztm_full(fd):
+            out = {}
+            for cn, fv in fd.items():
+                nf = dict(fv)
+                if 'X' in tied_dirs: nf['My'] = 0.0
+                if 'Y' in tied_dirs: nf['Mx'] = 0.0
+                out[cn] = nf
+            return out
+        ads_f = _ztm_full(ads_f)
+        lrfd_f = _ztm_full(lrfd_f)
 
     # ADS + FS volcamiento + FS deslizamiento
     ads_audit = []; max_q = 0; min_q = 9999; ctrl_ads = ''; any_partial = False

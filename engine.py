@@ -2035,18 +2035,31 @@ def run_design(model_data, classifications, params, user_ties=None, user_dims=No
                 for c in footings[g].get("cols", []):
                     group_cols.append(c)
 
+            # user_dims para combinadas: la clave es el ID provisional ZC-XX
+            _cid_key = f"ZC-{cidx:02d}"
+            _ud_comb = (user_dims or {}).get(_cid_key, {})
             r = design_combined_footing(
-                grp, footings, group_cols, ads_all, lrfd_all, params, cidx
+                grp, footings, group_cols, ads_all, lrfd_all, params, cidx,
+                user_B=_ud_comb.get('B'), user_L=_ud_comb.get('L'), user_h=_ud_comb.get('h')
             )
             final.append(r)
             cidx += 1
 
     # ── Análisis de sistemas enlazados con convergencia ──
     tie_systems_raw = build_tie_systems(final, ties)
+    footing_tie_dirs: dict = {}   # rebuilt at start of each convergence iteration
+
     max_convergence_iter = 4
     convergence_tol = 0.05  # m
 
     for conv_iter in range(max_convergence_iter):
+        # Rebuild footing_tie_dirs each iteration (tie_systems_raw may have been
+        # updated if footings were merged in a previous post-convergence pass).
+        footing_tie_dirs = {}
+        for _sys in tie_systems_raw:
+            for _fid in _sys.get('footings', []):
+                footing_tie_dirs.setdefault(_fid, set()).add(_sys['direction'])
+
         tie_systems = []
         for sys in tie_systems_raw:
             result = analyze_tie_system(sys, final, jloads_design, combos, params)
@@ -2071,19 +2084,33 @@ def run_design(model_data, classifications, params, user_ties=None, user_dims=No
                 continue
 
             cl_info = classifications.get(jid, {"location": "concentrica"})
+            _tied = footing_tie_dirs.get(f["id"], set())
 
-            # Add system dP to ADS forces for re-optimization
+            # Apply system dP (signed) and zero tied-direction moments.
+            # dP sign convention: positive = footing carries extra load from
+            # adjacent spans (R > P); negative = footing is relieved.
+            # Since fv['P'] is negative (compression in SAP), subtracting dP
+            # makes it more negative (larger abs) when dP > 0, and less negative
+            # (smaller abs) when dP < 0 — which is correct.
             ads_f_aug = {}
             for cn, fv in ads_all.get(jid, {}).items():
                 dP = f.get("system_dP_by_combo", {}).get(cn, 0)
-                ads_f_aug[cn] = {**fv, "P": fv["P"] - abs(dP)}
+                nfv = dict(fv); nfv["P"] = fv["P"] - dP   # signed, not abs
+                if _tied:
+                    if 'X' in _tied: nfv["My"] = 0.0
+                    if 'Y' in _tied: nfv["Mx"] = 0.0
+                ads_f_aug[cn] = nfv
 
             lrfd_f_aug = {}
             for cn, fv in lrfd_all.get(jid, {}).items():
                 dP = f.get("system_dP_lrfd", {}).get(cn, 0)
-                lrfd_f_aug[cn] = {**fv, "P": fv["P"] - abs(dP)}
+                nfv = dict(fv); nfv["P"] = fv["P"] - dP   # signed, not abs
+                if _tied:
+                    if 'X' in _tied: nfv["My"] = 0.0
+                    if 'Y' in _tied: nfv["Mx"] = 0.0
+                lrfd_f_aug[cn] = nfv
 
-            opt = optimize_isolated(col, ads_f_aug, lrfd_f_aug, params, cl_info)
+            opt = optimize_isolated(col, ads_f_aug, lrfd_f_aug, params, cl_info, tied_dirs=_tied)
 
             # Check convergence
             dB = abs(opt["B"] - f["B"])
@@ -2097,7 +2124,8 @@ def run_design(model_data, classifications, params, user_ties=None, user_dims=No
                 r = full_structural_design(
                     jid,
                     opt["x_footing"], opt["y_footing"], opt["B"], opt["L"], opt["h"],
-                    col["bx"], col["by"], ads_f_aug, lrfd_all.get(jid, {}), params, cf
+                    col["bx"], col["by"], ads_f_aug, lrfd_f_aug, params, cf,
+                    tied_dirs=_tied
                 )
 
                 # Preserve metadata
@@ -2134,6 +2162,200 @@ def run_design(model_data, classifications, params, user_ties=None, user_dims=No
         "converged": conv_iter < max_convergence_iter - 1,
         "resized_footings": [f["id"] for f in final if f.get("resized_iter", 0) > 0],
     }
+
+    # ── Segundo pase de solapamientos post-convergencia ────────────────────────
+    # Verifica ALL non-wall footings (aisladas Y combinadas) entre sí.
+    # Caso típico: ZC-01 se diseña con B amplio y solapa con Z-19 (esquinera)
+    # aunque J1/J3 y J2 no solapaban individualmente en el pase inicial.
+    # Muros siempre quedan independientes.
+    _chk_indices = [i for i, f in enumerate(final)
+                    if not f.get("is_wall_equivalent", False)]
+    _chk_list = [final[i] for i in _chk_indices]
+
+    if len(_chk_list) >= 2:
+        _ovs2, _grps2 = check_overlaps(_chk_list, min_gap=0.02)
+
+        if any(len(g) > 1 for g in _grps2):
+            # Actualizar ovs para el reporte
+            for _pi, _pj in _ovs2:
+                _pair = (_chk_indices[_pi], _chk_indices[_pj])
+                if _pair not in ovs:
+                    ovs.append(_pair)
+
+            _rebuilt = []
+            for _grp in _grps2:
+                if len(_grp) == 1:
+                    _rebuilt.append(_chk_list[_grp[0]])
+                else:
+                    # Fusionar: recoger TODOS los cols de todas las zapatas del grupo
+                    # (funciona tanto si el grupo es solo-aisladas como mixed combinada+aislada)
+                    _gfoot = [_chk_list[g] for g in _grp]
+                    _gcols = [c for _gf in _gfoot for c in _gf.get("cols", [])]
+                    # Eliminar cols duplicados por joint
+                    _seen_j = set()
+                    _gcols_u = []
+                    for _c in _gcols:
+                        if _c['joint'] not in _seen_j:
+                            _seen_j.add(_c['joint'])
+                            _gcols_u.append(_c)
+                    _rc = design_combined_footing(
+                        list(range(len(_gfoot))),
+                        _gfoot,
+                        _gcols_u,
+                        ads_all, lrfd_all, params, cidx
+                    )
+                    _rebuilt.append(_rc)
+                    cidx += 1
+
+            # Conservar sólo muros; todo lo demás viene de _rebuilt
+            _walls = [f for f in final if f.get("is_wall_equivalent", False)]
+            final = _rebuilt + _walls
+
+            # Recalcular sistemas de vigas con la nueva geometría
+            tie_systems_raw = build_tie_systems(final, ties)
+            footing_tie_dirs = {}
+            for _sys in tie_systems_raw:
+                for _fid in _sys.get('footings', []):
+                    footing_tie_dirs.setdefault(_fid, set()).add(_sys['direction'])
+            tie_systems = []
+            for _sys in tie_systems_raw:
+                _res = analyze_tie_system(_sys, final, jloads_design, combos, params)
+                tie_systems.append(_res)
+            # Actualizar system_ids y delta_R en zapatas con nueva geometría
+            apply_system_reactions_to_footings(final, tie_systems, ads_all, lrfd_all, params)
+
+    # ── Jerarquía de zapatas combinadas ──────────────────────────────────────────
+    # Tras converger el sistema de vigas, cada columna de la zapata combinada se
+    # optimiza individualmente (como si fuera aislada) con su carga neta del sistema.
+    # La dimensión resultante mayor se usa como mínimo para la combinada.
+    # Jerarquía: sistema de vigas → aisladas por columna → máximo → combinada.
+    _combined_hierarchy_changed = False
+    for _fi, _f in enumerate(final):
+        if _f.get("type") != "combined" or _f.get("is_wall_equivalent"):
+            continue
+        _fid = _f.get("id", "")
+        _cols_f = _f.get("cols", [])
+        if not _cols_f:
+            continue
+
+        _cc = _f.get("combined_constraints", {})
+        _locked_B = _cc.get("locked_B", False)
+        _locked_L = _cc.get("locked_L", False)
+
+        # Delta total del sistema (nivel zapata)
+        _dP_total_ads = _f.get("system_dP", 0)
+        _dP_lrfd_by_combo = _f.get("system_dP_lrfd", {})
+
+        # Carga de servicio total de la combinada para ponderar delta por columna
+        _P_col_ads = {}
+        for _cj in _cols_f:
+            _j = _cj["joint"]
+            _best_P = 0
+            for _cn, _fv in ads_all.get(_j, {}).items():
+                if "D+L" in _cn:
+                    _best_P = abs(_fv.get("P", 0)); break
+            if _best_P == 0:
+                _best_P = max((abs(_fv.get("P", 0)) for _fv in ads_all.get(_j, {}).values()), default=1.0)
+            _P_col_ads[_j] = max(_best_P, 1.0)
+        _P_comb_total = sum(_P_col_ads.values()) or 1.0
+
+        _tied = footing_tie_dirs.get(_fid, set())
+        _B_iso_list = []
+        _L_iso_list = []
+
+        for _cj in _cols_f:
+            _j = _cj["joint"]
+            _w = _P_col_ads[_j] / _P_comb_total
+
+            # Cargas ADS por columna con su fracción del delta del sistema
+            _ads_cj = {}
+            for _cn, _fv in ads_all.get(_j, {}).items():
+                _dP_c = _dP_total_ads * _w
+                _nfv = dict(_fv)
+                _nfv["P"] = _fv["P"] - _dP_c
+                if _tied:
+                    if "X" in _tied: _nfv["My"] = 0.0
+                    if "Y" in _tied: _nfv["Mx"] = 0.0
+                _ads_cj[_cn] = _nfv
+
+            _lrfd_cj = {}
+            for _cn, _fv in lrfd_all.get(_j, {}).items():
+                _dP_lrfd_c = _dP_lrfd_by_combo.get(_cn, 0) * _w
+                _nfv = dict(_fv)
+                _nfv["P"] = _fv["P"] - _dP_lrfd_c
+                if _tied:
+                    if "X" in _tied: _nfv["My"] = 0.0
+                    if "Y" in _tied: _nfv["Mx"] = 0.0
+                _lrfd_cj[_cn] = _nfv
+
+            _cl_cj = classifications.get(str(_j), {"location": "concentrica"})
+            try:
+                _opt_cj = optimize_isolated(_cj, _ads_cj, _lrfd_cj, params, _cl_cj, tied_dirs=_tied)
+                _B_iso_list.append(_opt_cj["B"])
+                _L_iso_list.append(_opt_cj["L"])
+            except Exception:
+                pass
+
+        if not _B_iso_list:
+            continue
+
+        _B_min_hier = max(_B_iso_list)
+        _L_min_hier = max(_L_iso_list)
+
+        # Anotar resultado de jerarquía en el objeto zapata (para UI)
+        _f["hierarchy_check"] = {
+            "B_iso_list": [round(b, 3) for b in _B_iso_list],
+            "L_iso_list": [round(l, 3) for l in _L_iso_list],
+            "B_min_hier": round(_B_min_hier, 3),
+            "L_min_hier": round(_L_min_hier, 3),
+            "locked_B": _locked_B,
+            "locked_L": _locked_L,
+        }
+
+        _needs_grow = (
+            (not _locked_B and _f["B"] < _B_min_hier - 0.04) or
+            (not _locked_L and _f["L"] < _L_min_hier - 0.04)
+        )
+        if not _needs_grow:
+            _f["hierarchy_check"]["ok"] = True
+            continue
+
+        # Re-diseñar zapata combinada con dimensiones mínimas de jerarquía
+        _f["hierarchy_check"]["ok"] = False
+        _ud_comb_h = (user_dims or {}).get(_fid, {})
+        _new_B = None if _locked_B else max(_f["B"], _B_min_hier)
+        _new_L = None if _locked_L else max(_f["L"], _L_min_hier)
+        if _ud_comb_h.get("B"): _new_B = max(_new_B or _f["B"], float(_ud_comb_h["B"]))
+        if _ud_comb_h.get("L"): _new_L = max(_new_L or _f["L"], float(_ud_comb_h["L"]))
+
+        try:
+            _r_hier = design_combined_footing(
+                [0], [_f], _cols_f,
+                ads_all, lrfd_all, params, cidx,
+                user_B=_new_B, user_L=_new_L, user_h=_ud_comb_h.get("h")
+            )
+            _r_hier["id"] = _fid
+            _r_hier["hierarchy_check"] = dict(_f["hierarchy_check"])
+            _r_hier["hierarchy_check"]["resized"] = True
+            _r_hier["hierarchy_check"]["B_before"] = round(_f["B"], 3)
+            _r_hier["hierarchy_check"]["L_before"] = round(_f["L"], 3)
+            final[_fi] = _r_hier
+            cidx += 1
+            _combined_hierarchy_changed = True
+        except Exception:
+            pass
+
+    # Si alguna combinada creció por jerarquía, recalcular sistemas de vigas
+    if _combined_hierarchy_changed:
+        tie_systems_raw = build_tie_systems(final, ties)
+        footing_tie_dirs = {}
+        for _sys in tie_systems_raw:
+            for _fid in _sys.get("footings", []):
+                footing_tie_dirs.setdefault(_fid, set()).add(_sys["direction"])
+        tie_systems = []
+        for _sys in tie_systems_raw:
+            tie_systems.append(analyze_tie_system(_sys, final, jloads_design, combos, params))
+        apply_system_reactions_to_footings(final, tie_systems, ads_all, lrfd_all, params)
 
     ta = sum(f["A"] for f in final)
     tv = sum(f["A"] * f["h"] for f in final)

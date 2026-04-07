@@ -100,7 +100,8 @@ def compute_steel_diagram(long_analysis, b_trans, d, fc, fy):
     }
 
 
-def design_combined_footing(grp_indices, footings, group_cols, ads_all, lrfd_all, params, cidx):
+def design_combined_footing(grp_indices, footings, group_cols, ads_all, lrfd_all, params, cidx,
+                            user_B=None, user_L=None, user_h=None):
     """
     Diseña una zapata combinada a partir de un grupo de zapatas solapadas.
 
@@ -112,6 +113,9 @@ def design_combined_footing(grp_indices, footings, group_cols, ads_all, lrfd_all
         lrfd_all: fuerzas LRFD por nudo
         params: parámetros de diseño
         cidx: índice para ID de combinada
+        user_B / user_L / user_h: dimensiones forzadas (modo re-verificar)
+            Si se proveen, se usan como punto de partida y solo se expande si es necesario
+            para contener las columnas. NO se aplica la reducción automática.
 
     Returns:
         dict con resultado de diseño completo + metadatos
@@ -123,13 +127,34 @@ def design_combined_footing(grp_indices, footings, group_cols, ads_all, lrfd_all
     for g in grp_indices:
         fg = footings[g]
         col_forces_all.update(fg.get('column_forces', {}))
-        source_locations.append({
-            'joint': fg['joint'],
-            'location': fg.get('classification', {}).get('location', 'concentrica'),
-            'side': fg.get('classification', {}).get('side', ''),
-            'corner': fg.get('classification', {}).get('corner', ''),
-            'scheme': fg.get('scheme', 'aislada'),
-        })
+        if fg.get('type') == 'combined':
+            # ── Expandir: heredar restricciones individuales de la zapata ya combinada ──
+            # En el segundo pase de fusión (e.g. ZC-01 + Z-19 → ZC-02), ZC-01 ya tiene
+            # combined_constraints con las restricciones originales de sus columnas.
+            # Si usamos solo la clasificación de ZC-01 ('combinada_esquinera'), el
+            # sistema de pines no puede determinar cuáles caras X/Y están restringidas.
+            sub_sls = fg.get('combined_constraints', {}).get('source_locations', [])
+            if sub_sls:
+                source_locations.extend(sub_sls)
+            else:
+                # Fallback: intentar reconstruir desde las cols de la zapata combinada
+                for _c in fg.get('cols', []):
+                    _cj = _c.get('joint', '')
+                    # No tenemos la clasificación individual en las cols, usar la heredada
+                    source_locations.append({
+                        'joint': _cj,
+                        'location': fg.get('combined_constraints', {}).get('source_locations', [{}])[0].get('location', 'concentrica'),
+                        'side': '', 'corner': '',
+                        'scheme': fg.get('scheme', 'combinada'),
+                    })
+        else:
+            source_locations.append({
+                'joint': fg['joint'],
+                'location': fg.get('classification', {}).get('location', 'concentrica'),
+                'side': fg.get('classification', {}).get('side', ''),
+                'corner': fg.get('classification', {}).get('corner', ''),
+                'scheme': fg.get('scheme', 'aislada'),
+            })
 
     # ── Heredar restricciones de borde/esquina ──
     edge_sides = set(); corners = set()
@@ -180,29 +205,80 @@ def design_combined_footing(grp_indices, footings, group_cols, ads_all, lrfd_all
     h_comb = max(params['h_min'], 0.15 * max(B_comb, L_comb))
     h_comb = math.ceil(h_comb * 20) / 20
 
-    # ── PIN ESTRICTO a linderos ──
+    # ── Aplicar dimensiones del usuario (modo re-verificar) ──
+    # Se respetan siempre que contengan al menos las columnas (min geométrico).
+    _user_mode = (user_B is not None or user_L is not None or user_h is not None)
+    if user_B is not None: B_comb = max(B_min, float(user_B))
+    if user_L is not None: L_comb = max(L_min, float(user_L))
+    if user_h is not None: h_comb = max(params['h_min'], float(user_h))
+
+    # ── PIN ESTRICTO a linderos — soporte múltiples restricciones en misma dirección ──
     xR_final = xR; yR_final = yR
     margin_borde = 0.05
-    pinned_x = False; pinned_y = False
 
+    # Recopilar TODOS los pines por cara (pueden venir de múltiples columnas)
+    x_minus_pins = []; x_plus_pins = []
+    y_minus_pins = []; y_plus_pins = []
     for sl in source_locations:
-        jid_s = sl['joint']
-        col_s = next((c for c in group_cols if c['joint'] == jid_s), None)
+        col_s = next((c for c in group_cols if c['joint'] == sl['joint']), None)
         if not col_s: continue
         side_s = sl.get('side', ''); corner_s = sl.get('corner', '')
         if sl['location'] in ('medianera', 'esquinera'):
             if side_s == 'X-' or (corner_s and 'X-' in corner_s):
-                pin_x = col_s['x'] - col_s['bx'] / 2 - margin_borde
-                xR_final = pin_x + B_comb / 2; pinned_x = True
-            elif side_s == 'X+' or (corner_s and 'X+' in corner_s):
-                pin_x = col_s['x'] + col_s['bx'] / 2 + margin_borde
-                xR_final = pin_x - B_comb / 2; pinned_x = True
+                x_minus_pins.append(col_s['x'] - col_s['bx'] / 2 - margin_borde)
+            if side_s == 'X+' or (corner_s and 'X+' in corner_s):
+                x_plus_pins.append(col_s['x'] + col_s['bx'] / 2 + margin_borde)
             if side_s == 'Y-' or (corner_s and 'Y-' in corner_s):
-                pin_y = col_s['y'] - col_s['by'] / 2 - margin_borde
-                yR_final = pin_y + L_comb / 2; pinned_y = True
-            elif side_s == 'Y+' or (corner_s and 'Y+' in corner_s):
-                pin_y = col_s['y'] + col_s['by'] / 2 + margin_borde
-                yR_final = pin_y - L_comb / 2; pinned_y = True
+                y_minus_pins.append(col_s['y'] - col_s['by'] / 2 - margin_borde)
+            if side_s == 'Y+' or (corner_s and 'Y+' in corner_s):
+                y_plus_pins.append(col_s['y'] + col_s['by'] / 2 + margin_borde)
+
+    # Pines dominantes: el más extremo de cada cara
+    left_pin  = min(x_minus_pins) if x_minus_pins else None   # borde izq fijo
+    right_pin = max(x_plus_pins)  if x_plus_pins  else None   # borde der fijo
+    bot_pin   = min(y_minus_pins) if y_minus_pins  else None   # borde inf fijo
+    top_pin   = max(y_plus_pins)  if y_plus_pins   else None   # borde sup fijo
+
+    # Bloqueo total: AMBAS caras restringidas → B/L es fijo, no puede crecer
+    locked_B = (left_pin is not None and right_pin is not None)
+    locked_L = (bot_pin  is not None and top_pin  is not None)
+
+    pinned_x = (left_pin is not None or right_pin is not None)
+    pinned_y = (bot_pin  is not None or top_pin   is not None)
+
+    if locked_B:
+        B_comb = max(dmin, math.ceil((right_pin - left_pin) * 20) / 20)
+        xR_final = round((left_pin + right_pin) / 2, 3)
+    elif left_pin is not None:
+        xR_final = round(left_pin + B_comb / 2, 3)
+    elif right_pin is not None:
+        xR_final = round(right_pin - B_comb / 2, 3)
+
+    if locked_L:
+        L_comb = max(dmin, math.ceil((top_pin - bot_pin) * 20) / 20)
+        yR_final = round((bot_pin + top_pin) / 2, 3)
+    elif bot_pin is not None:
+        yR_final = round(bot_pin + L_comb / 2, 3)
+    elif top_pin is not None:
+        yR_final = round(top_pin - L_comb / 2, 3)
+
+    def _repin_x():
+        nonlocal xR_final
+        if locked_B:
+            xR_final = round((left_pin + right_pin) / 2, 3)
+        elif left_pin is not None:
+            xR_final = round(left_pin + B_comb / 2, 3)
+        elif right_pin is not None:
+            xR_final = round(right_pin - B_comb / 2, 3)
+
+    def _repin_y():
+        nonlocal yR_final
+        if locked_L:
+            yR_final = round((bot_pin + top_pin) / 2, 3)
+        elif bot_pin is not None:
+            yR_final = round(bot_pin + L_comb / 2, 3)
+        elif top_pin is not None:
+            yR_final = round(top_pin - L_comb / 2, 3)
 
     # Contención
     req_xmin = env_xmin - margin; req_xmax = env_xmax + margin
@@ -210,45 +286,25 @@ def design_combined_footing(grp_indices, footings, group_cols, ads_all, lrfd_all
     zap_xmin = xR_final - B_comb / 2; zap_xmax = xR_final + B_comb / 2
     zap_ymin = yR_final - L_comb / 2; zap_ymax = yR_final + L_comb / 2
 
-    def _repin_x():
-        nonlocal xR_final
-        for sl in source_locations:
-            col_s = next((c for c in group_cols if c['joint'] == sl['joint']), None)
-            if not col_s: continue
-            ss = sl.get('side', ''); cs = sl.get('corner', '')
-            if ss == 'X-' or (cs and 'X-' in cs):
-                xR_final = round(col_s['x'] - col_s['bx'] / 2 - margin_borde + B_comb / 2, 3); return
-            elif ss == 'X+' or (cs and 'X+' in cs):
-                xR_final = round(col_s['x'] + col_s['bx'] / 2 + margin_borde - B_comb / 2, 3); return
-
-    def _repin_y():
-        nonlocal yR_final
-        for sl in source_locations:
-            col_s = next((c for c in group_cols if c['joint'] == sl['joint']), None)
-            if not col_s: continue
-            ss = sl.get('side', ''); cs = sl.get('corner', '')
-            if ss == 'Y-' or (cs and 'Y-' in cs):
-                yR_final = round(col_s['y'] - col_s['by'] / 2 - margin_borde + L_comb / 2, 3); return
-            elif ss == 'Y+' or (cs and 'Y+' in cs):
-                yR_final = round(col_s['y'] + col_s['by'] / 2 + margin_borde - L_comb / 2, 3); return
-
     if zap_xmin > req_xmin or zap_xmax < req_xmax:
-        if pinned_x:
+        if pinned_x and not locked_B:
             need_left = max(0, zap_xmin - req_xmin); need_right = max(0, req_xmax - zap_xmax)
             B_comb = math.ceil((B_comb + need_left + need_right) * 20) / 20
             _repin_x()
-        else:
+        elif not pinned_x:
             if xR_final - B_comb / 2 > req_xmin: xR_final = req_xmin + B_comb / 2
             if xR_final + B_comb / 2 < req_xmax: xR_final = req_xmax - B_comb / 2
+        # locked_B: no se puede expandir, se acepta la contención fallida
 
     if zap_ymin > req_ymin or zap_ymax < req_ymax:
-        if pinned_y:
+        if pinned_y and not locked_L:
             need_bot = max(0, zap_ymin - req_ymin); need_top = max(0, req_ymax - zap_ymax)
             L_comb = math.ceil((L_comb + need_bot + need_top) * 20) / 20
             _repin_y()
-        else:
+        elif not pinned_y:
             if yR_final - L_comb / 2 > req_ymin: yR_final = req_ymin + L_comb / 2
             if yR_final + L_comb / 2 < req_ymax: yR_final = req_ymax - L_comb / 2
+        # locked_L: no se puede expandir
 
     xR_final = round(xR_final, 3); yR_final = round(yR_final, 3)
 
@@ -286,8 +342,10 @@ def design_combined_footing(grp_indices, footings, group_cols, ads_all, lrfd_all
         if r['st'] not in ('NO_CUMPLE', 'REVISAR_h'): break
         if r['st'] == 'NO_CUMPLE':
             sc = 1.1
-            B_comb = math.ceil(B_comb * sc * 20) / 20
-            L_comb = math.ceil(L_comb * sc * 20) / 20
+            if not locked_B:
+                B_comb = math.ceil(B_comb * sc * 20) / 20
+            if not locked_L:
+                L_comb = math.ceil(L_comb * sc * 20) / 20
             if pinned_x: _repin_x()
             else:
                 if xR_final - B_comb / 2 > req_xmin: xR_final = round(req_xmin + B_comb / 2, 3)
@@ -313,17 +371,27 @@ def design_combined_footing(grp_indices, footings, group_cols, ads_all, lrfd_all
                              'col_rect': [round(c_xmin, 3), round(c_ymin, 3), round(c_xmax, 3), round(c_ymax, 3)]})
 
     if not all_contained:
+        _geom_changed = False
         for cd in cont_details:
             if not cd['contained']:
                 cr = cd['col_rect']
-                if cr[0] < zap_xmin: B_comb = math.ceil((B_comb + (zap_xmin - cr[0] + margin)) * 20) / 20
-                if cr[2] > zap_xmax: B_comb = math.ceil((B_comb + (cr[2] - zap_xmax + margin)) * 20) / 20
-                if cr[1] < zap_ymin: L_comb = math.ceil((L_comb + (zap_ymin - cr[1] + margin)) * 20) / 20
-                if cr[3] > zap_ymax: L_comb = math.ceil((L_comb + (cr[3] - zap_ymax + margin)) * 20) / 20
-        r = full_structural_design(
-            '+'.join(c['joint'] for c in group_cols),
-            xR_final, yR_final, B_comb, L_comb, h_comb, cbx, cby, ads_c, lrfd_c, params, col_forces_all)
-        all_contained = True
+                if not locked_B:
+                    if cr[0] < zap_xmin:
+                        B_comb = math.ceil((B_comb + (zap_xmin - cr[0] + margin)) * 20) / 20; _geom_changed = True
+                    if cr[2] > zap_xmax:
+                        B_comb = math.ceil((B_comb + (cr[2] - zap_xmax + margin)) * 20) / 20; _geom_changed = True
+                if not locked_L:
+                    if cr[1] < zap_ymin:
+                        L_comb = math.ceil((L_comb + (zap_ymin - cr[1] + margin)) * 20) / 20; _geom_changed = True
+                    if cr[3] > zap_ymax:
+                        L_comb = math.ceil((L_comb + (cr[3] - zap_ymax + margin)) * 20) / 20; _geom_changed = True
+        if _geom_changed:
+            if pinned_x: _repin_x()
+            if pinned_y: _repin_y()
+            r = full_structural_design(
+                '+'.join(c['joint'] for c in group_cols),
+                xR_final, yR_final, B_comb, L_comb, h_comb, cbx, cby, ads_c, lrfd_c, params, col_forces_all)
+        # all_contained left as-is: if locked prevented expansion, it stays False → shown in UI
 
     # ── Esquema heredado ──
     if has_edge and has_corner: inherited_scheme = 'combinada_restringida'
@@ -377,5 +445,9 @@ def design_combined_footing(grp_indices, footings, group_cols, ads_all, lrfd_all
         'has_edge_constraint': has_edge, 'edge_sides': list(edge_sides),
         'has_corner_constraint': has_corner, 'corners': list(corners),
         'has_eccentric_columns': has_eccentric, 'source_locations': source_locations,
+        'locked_B': locked_B, 'locked_L': locked_L,
+        'left_pin': left_pin, 'right_pin': right_pin,
+        'bot_pin': bot_pin, 'top_pin': top_pin,
+        'pinned_x': pinned_x, 'pinned_y': pinned_y,
     }
     return r
