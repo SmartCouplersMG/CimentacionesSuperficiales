@@ -249,7 +249,7 @@ def optimize_isolated(col, ads_f, lrfd_f, params, classification, tied_dirs=None
                 elif ecc_y > 0: zy = cy - ecc_y + L / 2
             zx = round(zx, 3); zy = round(zy, 3)
             for h in h_vals:
-                A = B * L; Wt = gc * A * h + gs * A * (Df - h); d = h - rec - 0.016; d = max(d, 0.10)
+                A = B * L; Wt = gc * A * h + gs * A * (Df - h); d = h - rec - 0.006; d = max(d, 0.10)
                 ok = True
                 for cn, f in ads_f.items():
                     Pt = abs(f['P']) + Wt; qa = qmap.get(f.get('group', 'q1'), qa_ref)
@@ -287,15 +287,27 @@ def optimize_isolated(col, ads_f, lrfd_f, params, classification, tied_dirs=None
 # ================================================================
 # DISEÑO ESTRUCTURAL COMPLETO (dimensiones fijas)
 # ================================================================
-def full_structural_design(jid, x, y, B, L, h, col_bx, col_by, ads_f, lrfd_f, params, column_forces=None, tied_dirs=None):
-    """Auditoría ADS + LRFD completa. Incluye FS volcamiento y deslizamiento."""
+def full_structural_design(jid, x, y, B, L, h, col_bx, col_by, ads_f, lrfd_f, params,
+                            column_forces=None, tied_dirs=None,
+                            col_shear_bx=None, col_shear_by=None):
+    """
+    Auditoría ADS + LRFD completa. Incluye FS volcamiento y deslizamiento.
+
+    col_shear_bx / col_shear_by (opcionales):
+        Ancho efectivo de columna para el cálculo del VOLADIZO en cortante 1-vía.
+        Para zapatas aisladas = col_bx / col_by (valor por defecto).
+        Para zapatas COMBINADAS = tramo entre caras exteriores de todas las columnas en
+        cada dirección.  Esto evita que 'cant = (B - cbx)/2' use solo el tamaño de
+        una columna cuando la zapata abarca varias, produciendo voladizos irrealistas.
+        col_bx / col_by siguen siendo usados para el perímetro de punzonamiento.
+    """
     fc = params['fc']; fy = params['fy']; rec = params['rec']
     gc = params['gamma_c']; gs = params['gamma_s']; Df = params['Df']
     mu = params.get('mu', 0.40)
     fs_volc_min_p = params.get('fs_volc_min', {'q1': 2.0, 'q2': 1.5, 'q3': 1.5})
     fs_desl_min_p = params.get('fs_desl_min', {'q1': 1.5, 'q2': 1.2, 'q3': 1.2})
     qmap = {'q1': params['qadm_1'], 'q2': params['qadm_2'], 'q3': params['qadm_3']}
-    A = B * L; Wf = gc * A * h; Ws = gs * A * (Df - h); Wt = Wf + Ws; d = h - rec - 0.016; d = max(d, 0.10)
+    A = B * L; Wf = gc * A * h; Ws = gs * A * (Df - h); Wt = Wf + Ws; d = h - rec - 0.006; d = max(d, 0.10)
 
     # Zero moments in directions restrained by tie beams.
     # Tie in X → beam along X restrains My (eccentricity in X) → My = 0.
@@ -354,20 +366,31 @@ def full_structural_design(jid, x, y, B, L, h, col_bx, col_by, ads_f, lrfd_f, pa
     for cn, f in lrfd_f.items():
         Pu = abs(f['P']); Mxu = f['Mx']; Myu = f['My']; sp_u = soil_pressure(Pu, Mxu, Myu, B, L)
         punch = punching_with_moment(Pu, Mxu, Myu, B, L, col_bx, col_by, d, fc); pr = punch['ratio']
-        sx = factored_pressure_at_face(Pu, Mxu, Myu, B, L, col_bx, col_by, d, 'x')
-        sy = factored_pressure_at_face(Pu, Mxu, Myu, B, L, col_bx, col_by, d, 'y')
+        # Para cortante 1-vía usar col_shear_bx/by si se proveyeron (zapatas combinadas):
+        # el cantilever real = (B - span_entre_caras)/2, no (B - col_bx)/2.
+        _csbx = col_shear_bx if col_shear_bx is not None else col_bx
+        _csby = col_shear_by if col_shear_by is not None else col_by
+        sx = factored_pressure_at_face(Pu, Mxu, Myu, B, L, _csbx, _csby, d, 'x')
+        sy = factored_pressure_at_face(Pu, Mxu, Myu, B, L, _csbx, _csby, d, 'y')
         vc1w = 0.17 * math.sqrt(fc / 1000) * 1000; pv = 0.75
         pVnx = pv * vc1w * sx['b_resist'] * d; pVny = pv * vc1w * sy['b_resist'] * d
         srx = sx['Vu'] / pVnx if pVnx > 0 else 999; sry = sy['Vu'] / pVny if pVny > 0 else 999; sr = max(srx, sry)
         As_x = calc_as(sx['Mu'], B, d, fc, fy); As_y = calc_as(sy['Mu'], L, d, fc, fy)
         if Pu > Pu_max: Pu_max = Pu; ctrl_lrfd = cn
         pr_max = max(pr_max, pr); sr_max = max(sr_max, sr)
+        # ex/ey (LRFD): excentricidades de la carga última respecto al centroide
+        _ex_u = round(abs(Myu) / Pu, 4) if Pu > 0 else 0
+        _ey_u = round(abs(Mxu) / Pu, 4) if Pu > 0 else 0
         lrfd_audit.append({
             'combo': cn, 'Pu': round(Pu, 2), 'Mux': round(Mxu, 2), 'Muy': round(Myu, 2),
+            'ex': _ex_u, 'ey': _ey_u,
             'Vux': round(f['Vx'], 2), 'Vuy': round(f['Vy'], 2),
             'q1': sp_u['q1'], 'q2': sp_u['q2'], 'q3': sp_u['q3'], 'q4': sp_u['q4'], 'contact': sp_u['contact'],
+            # Punzonamiento (ACI 318 §22.6) — tensiones en kPa, fuerza Vu_punch en kN
+            'Vu_punch': punch['Vu'],
             'vu_direct': punch['vu_direct'], 'vu_mx': punch['vu_mx'], 'vu_my': punch['vu_my'],
             'vu_max': punch['vu_max'], 'phi_vc': punch['phi_vc'], 'punch_ratio': round(pr, 3),
+            # Cortante 1-vía (viga amplia) en kN
             'Vu_x': sx['Vu'], 'phi_Vn_x': round(pVnx, 1), 'sr_x': round(srx, 3),
             'Vu_y': sy['Vu'], 'phi_Vn_y': round(pVny, 1), 'sr_y': round(sry, 3), 'shear_ratio': round(sr, 3),
             'Mu_x': round(sx['Mu'], 2), 'Mu_y': round(sy['Mu'], 2), 'As_x': round(As_x, 1), 'As_y': round(As_y, 1)})

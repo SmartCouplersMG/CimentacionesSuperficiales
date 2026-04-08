@@ -189,6 +189,7 @@ with st.sidebar:
         SmartCouplers MG SAS.<br>
         No está auditada ni validada.<br>
         NO USAR PARA FINES PROFESIONALES!<br>
+        Ultima Modificacion 07-07042026<br>
         </div>
         """,
         unsafe_allow_html=True
@@ -1461,11 +1462,18 @@ with tab_aisladas:
             rx = propose_rebar(f['Asx'], f['B'], rec)
             ry = propose_rebar(f['Asy'], f['L'], rec)
             loc_info = f.get('classification', {}).get('location', '')
+            # Caso crítico LRFD (mayor ratio de punzonamiento)
+            _lc = max(f.get('lrfd_audit', [{}]), key=lambda a: a.get('punch_ratio', 0), default={})
             rows.append({
                 'ID': f['id'], 'Loc': loc_info[:8],
                 'B': f['B'], 'L': f['L'], 'h': f['h'],
                 'qmax': f['qmax'], 'qmin': f['qmin'],
-                'Pu': f['Pu'], 'P%': round(f['pr']*100, 1), 'V%': round(f['sr']*100, 1),
+                'Pu': f['Pu'],
+                'Mux*': _lc.get('Mux', 0), 'Muy*': _lc.get('Muy', 0),
+                'ex*': _lc.get('ex', 0), 'ey*': _lc.get('ey', 0),
+                'Vu_x': _lc.get('Vu_x', 0), 'Vx%': round(_lc.get('sr_x', 0)*100, 1),
+                'Vu_y': _lc.get('Vu_y', 0), 'Vy%': round(_lc.get('sr_y', 0)*100, 1),
+                'Vu_pun': _lc.get('Vu_punch', 0), 'Pun%': round(_lc.get('punch_ratio', 0)*100, 1),
                 'Asx': f['Asx'], 'Ref X': rx['text'],
                 'Asy': f['Asy'], 'Ref Y': ry['text'],
                 'Estado': f['st'],
@@ -1488,12 +1496,18 @@ with tab_combinadas:
             rx = propose_rebar(f['Asx'], f['B'], rec)
             ry = propose_rebar(f['Asy'], f['L'], rec)
             cols_txt = '+'.join(c['joint'] for c in f.get('cols', []))
+            _lc = max(f.get('lrfd_audit', [{}]), key=lambda a: a.get('punch_ratio', 0), default={})
             rows.append({
                 'ID': f['id'], 'Esquema': f.get('scheme', '')[:12],
                 'Columnas': cols_txt,
                 'B': f['B'], 'L': f['L'], 'h': f['h'],
                 'qmax': f['qmax'], 'qmin': f['qmin'],
-                'Pu': f['Pu'], 'P%': round(f['pr']*100, 1), 'V%': round(f['sr']*100, 1),
+                'Pu': f['Pu'],
+                'Mux*': _lc.get('Mux', 0), 'Muy*': _lc.get('Muy', 0),
+                'ex*': _lc.get('ex', 0), 'ey*': _lc.get('ey', 0),
+                'Vu_x': _lc.get('Vu_x', 0), 'Vx%': round(_lc.get('sr_x', 0)*100, 1),
+                'Vu_y': _lc.get('Vu_y', 0), 'Vy%': round(_lc.get('sr_y', 0)*100, 1),
+                'Vu_pun': _lc.get('Vu_punch', 0), 'Pun%': round(_lc.get('punch_ratio', 0)*100, 1),
                 'Asx': f['Asx'], 'Ref X': rx['text'],
                 'Asy': f['Asy'], 'Ref Y': ry['text'],
                 'As sup': f.get('As_long_top', 0),
@@ -1683,6 +1697,18 @@ with tab_audit:
         styled = dfa.style.map(cr, subset=['Ratio']).map(cr_fs, subset=['FSv', 'FSd'])
         st.dataframe(styled, use_container_width=True, hide_index=True)
 
+        # ── Cargas por columna (solo zapatas combinadas) ──────────────────────
+        _ca_loads = sf.get('col_ads_loads', [])
+        if _ca_loads:
+            st.divider()
+            st.markdown("**📋 Cargas por columna individual (ADS)**")
+            st.caption("Fuerzas en la base de cada columna antes de transportar al centroide de la zapata combinada.")
+            _df_cal = pd.DataFrame(_ca_loads)
+            # Ordenar: columna → combo → P desc
+            if not _df_cal.empty:
+                _df_cal = _df_cal.sort_values(['Columna', 'P (kN)'], ascending=[True, False])
+            st.dataframe(_df_cal, use_container_width=True, hide_index=True)
+
     # V-M tab (solo combinadas)
     if sf.get('type') == 'combined' and sf.get('combined_analysis'):
         with t3:
@@ -1696,7 +1722,7 @@ with tab_audit:
             fig_vm.add_hline(y=0, line_dash="dot", line_color="#9ca3af")
             fig_vm.update_layout(title="Diagrama V-M longitudinal")
             apply_theme(fig_vm, height=350, equal_axes=False)
-            st.plotly_chart(fig_vm, use_container_width=True)
+            st.plotly_chart(fig_vm, use_container_width=True, key=f"vm_comb_{sf['id']}")
 
             if sd and sd.get('stations'):
                 fig_as = go.Figure()
@@ -1707,7 +1733,7 @@ with tab_audit:
                 fig_as.add_hline(y=0, line_dash="dot", line_color="#9ca3af")
                 fig_as.update_layout(title="Acero requerido [+inf, -sup]")
                 apply_theme(fig_as, height=280, equal_axes=False)
-                st.plotly_chart(fig_as, use_container_width=True)
+                st.plotly_chart(fig_as, use_container_width=True, key=f"as_comb_{sf['id']}")
 
     # LRFD tab
     lrfd_tab = t4 if (sf.get('type') == 'combined' and sf.get('combined_analysis')) else t3
@@ -1717,23 +1743,57 @@ with tab_audit:
         display_l = lrfd_sorted if show_l else lrfd_sorted[:10]
         rows_l = [{
             'Combo': a['combo'],
-            'Pu': a['Pu'],
-            'Mux': a['Mux'],
-            'Muy': a['Muy'],
-            'vu_max': a.get('vu_max', 0),
-            'φvc': a.get('phi_vc', 0),
-            'P%': round(a.get('punch_ratio', 0) * 100, 1),
-            'Vu_x': a.get('Vu_x', 0),
-            'φVn_x': a.get('phi_Vn_x', 0),
+            'Pu (kN)': a['Pu'],
+            'Mux (kN·m)': a['Mux'],
+            'Muy (kN·m)': a['Muy'],
+            'ex (m)': a.get('ex', 0),
+            'ey (m)': a.get('ey', 0),
+            # ─── Punzonamiento (ACI 318 §22.6) ───
+            'Vu_pun (kN)': a.get('Vu_punch', 0),
+            'vu_pun (kPa)': a.get('vu_max', 0),
+            'φvc_pun (kPa)': a.get('phi_vc', 0),
+            'Pun%': round(a.get('punch_ratio', 0) * 100, 1),
+            # ─── Cortante 1-vía dirección X ───
+            'Vu_x (kN)': a.get('Vu_x', 0),
+            'φVn_x (kN)': a.get('phi_Vn_x', 0),
             'Vx%': round(a.get('sr_x', 0) * 100, 1),
-            'Vu_y': a.get('Vu_y', 0),
-            'φVn_y': a.get('phi_Vn_y', 0),
+            # ─── Cortante 1-vía dirección Y ───
+            'Vu_y (kN)': a.get('Vu_y', 0),
+            'φVn_y (kN)': a.get('phi_Vn_y', 0),
             'Vy%': round(a.get('sr_y', 0) * 100, 1),
-            'Vmax%': round(a.get('shear_ratio', 0) * 100, 1),
-            'As_x': a.get('As_x', 0),
-            'As_y': a.get('As_y', 0),
+            'Vcorte%': round(a.get('shear_ratio', 0) * 100, 1),
+            'Mu_x (kN·m)': a.get('Mu_x', 0),
+            'Mu_y (kN·m)': a.get('Mu_y', 0),
+            'As_x (cm²)': a.get('As_x', 0),
+            'As_y (cm²)': a.get('As_y', 0),
         } for a in display_l]
+        st.caption("Ordenado por ratio de punzonamiento (mayor primero). "
+                   "Pun% = vu_pun/φvc_pun × 100. Vx%/Vy% = cortante 1-vía por dirección.")
         st.dataframe(pd.DataFrame(rows_l), use_container_width=True, hide_index=True)
+
+        # ── Punzonamiento por columna individual (solo zapatas combinadas) ──────
+        _cpa = sf.get('col_punch_audit', [])
+        if _cpa:
+            st.divider()
+            st.markdown("**🔩 Punzonamiento por columna individual (ACI 318 §22.6)**")
+            st.caption(
+                "Cada columna de la zapata combinada se verifica de forma independiente. "
+                "Vu_pun = Pu·(1 − Ap/A)  donde  Ap = (bx+d)·(by+d),  A = B·L (zapata completa). "
+                "El cortante 1-vía (viga amplia) se verifica globalmente en la tabla anterior."
+            )
+            _df_cp = pd.DataFrame(_cpa)
+            # Colorear fondo de Pun%: rojo >100, amarillo >75
+            if not _df_cp.empty and 'Pun%' in _df_cp.columns:
+                def _cr_pun(v):
+                    if isinstance(v, (int, float)):
+                        if v > 100: return 'background-color:#fee2e2;color:#991b1b'
+                        if v > 75:  return 'background-color:#fef3c7;color:#92400e'
+                    return ''
+                _df_cp = _df_cp.sort_values(['Columna', 'Pun%'], ascending=[True, False])
+                st.dataframe(_df_cp.style.map(_cr_pun, subset=['Pun%']),
+                             use_container_width=True, hide_index=True)
+            else:
+                st.dataframe(_df_cp, use_container_width=True, hide_index=True)
 
 # ════════════════════════════════════════════════
 # TAB: AUDITORÍA VIGAS
@@ -1798,7 +1858,7 @@ with tab_audit_v:
                 yaxis=dict(showticklabels=False, range=[-0.7, 1.2]),
                 xaxis=dict(range=[xmin_g, xmax_g]))
             apply_theme(fig_s, height=280, equal_axes=False)
-            st.plotly_chart(fig_s, use_container_width=True)
+            st.plotly_chart(fig_s, use_container_width=True, key=f"beam_model_{sd['system_id']}")
 
             aud = sd.get('audit', {})
             cols_a = st.columns(4)
@@ -1921,7 +1981,7 @@ with tab_audit_v:
                 fig_vm.add_hline(y=0, line_dash="dot", line_color="#9ca3af")
                 fig_vm.update_layout(title="Diagrama V-M de la viga")
                 apply_theme(fig_vm, height=350, equal_axes=False)
-                st.plotly_chart(fig_vm, use_container_width=True)
+                st.plotly_chart(fig_vm, use_container_width=True, key=f"vm_sys_{sd['system_id']}")
 
                 sdg = sd.get('steel_diagram')
                 if sdg and sdg.get('stations'):
@@ -1936,7 +1996,7 @@ with tab_audit_v:
                     fig_as.add_hline(y=0, line_dash="dot", line_color="#9ca3af")
                     fig_as.update_layout(title="Acero requerido [+inf, -sup]")
                     apply_theme(fig_as, height=280, equal_axes=False)
-                    st.plotly_chart(fig_as, use_container_width=True)
+                    st.plotly_chart(fig_as, use_container_width=True, key=f"as_sys_{sd['system_id']}")
             else:
                 st.info("Diagramas V-M no disponibles para este sistema.")
 
@@ -1970,36 +2030,86 @@ with tab_audit_v:
             sec_name   = f"VE_{int(round(b_v*100))}x{int(round(h_v*100))}"
             mat_name   = f"CONC_{int(round(fc_mpa))}MPa"
 
-            # ── Geometría: usar datos ya proyectados de analyze_tie_system ────
-            geom       = sys_data.get('geometry', {})
-            load_nodes = geom.get('loads', [])   # [{fid, x_load, x_sup, ecc, coalesced}]
-            jnds_per   = sys_data.get('joints', [])  # ['J1', 'J3,J2', ...] — por nodo
-
-            if not load_nodes:
-                return None, "Geometría del sistema no disponible (sin nodos de carga)."
-
             # Aplanar joint strings (pueden ser 'J1,J2' para combined nodes)
             def _flat(s):
                 return [j.strip() for j in str(s).split(',') if j.strip()]
 
-            all_j_flat = []
-            for _js in jnds_per:
-                all_j_flat.extend(_flat(_js))
-
             # ── Mapa fid → zapata (para peso propio de zapatas en caso SW) ──────
             f_fmap = {_f.get('id', ''): _f for _f in final_footings_list}
 
-            # ── Coordenada perpendicular del eje (fija para todo el modelo) ──
+            # ── Mapa joint → datos de columna ────────────────────────────────────
             j2col_map = {}
             for _f in final_footings_list:
                 for _c in _f.get('cols', []):
                     j2col_map[str(_c['joint'])] = _c
-            perp_vals = []
-            for _j in all_j_flat:
-                _c = j2col_map.get(_j)
-                if _c:
-                    perp_vals.append(_c['y'] if direction == 'X' else _c['x'])
-            beam_perp = round(sum(perp_vals) / len(perp_vals), 5) if perp_vals else 0.0
+
+            # ── Geometría ─────────────────────────────────────────────────────────
+            geom       = sys_data.get('geometry', {})
+            jnds_per   = sys_data.get('joints', [])   # ['J1', 'J3,J2', ...] — por nodo
+
+            if intra_comb:
+                # ── Geometría intra-combinada: reconstruir desde posiciones reales ─
+                # analyze_tie_system devuelve solo un punto ficticio en el centroide;
+                # para exportar a SAP2000 necesitamos:
+                #   • Un nudo de APOYO fijo en el centroide de la zapata.
+                #   • Un nudo de CARGA por cada columna en su posición proyectada.
+                #   • Viga continua de extremo a extremo (voladizos a ambos lados).
+                _fid_ic   = sys_data.get('footings', [''])[0]
+                _fobj_ic  = f_fmap.get(_fid_ic, {})
+                _cols_ic  = _fobj_ic.get('cols', [])
+                _xsup_ic  = (_fobj_ic.get('x_footing', _fobj_ic.get('x', 0))
+                             if direction == 'X'
+                             else _fobj_ic.get('y_footing', _fobj_ic.get('y', 0)))
+                # Joints del sistema (todos los que forman el intra-combinado)
+                _all_j_ic = []
+                for _js in jnds_per:
+                    _all_j_ic.extend(_flat(_js))
+                # Coord perp = promedio de columnas involucradas
+                _perp_ic = []
+                for _j in _all_j_ic:
+                    _cc = j2col_map.get(_j)
+                    if _cc:
+                        _perp_ic.append(_cc['y'] if direction == 'X' else _cc['x'])
+                beam_perp = round(sum(_perp_ic) / len(_perp_ic), 5) if _perp_ic else 0.0
+                # Construir load_nodes reales: uno por columna con sus joints
+                load_nodes = []
+                jnds_per_new = []
+                for _j in sorted(_all_j_ic,
+                                  key=lambda _jj: (j2col_map[_jj]['x'] if direction == 'X'
+                                                   else j2col_map[_jj]['y'])
+                                  if _jj in j2col_map else 0):
+                    _cc = j2col_map.get(_j)
+                    if not _cc:
+                        continue
+                    _xload = _cc['x'] if direction == 'X' else _cc['y']
+                    load_nodes.append({
+                        'fid': _fid_ic,
+                        'x_load': round(_xload, 4),
+                        'x_sup':  round(_xsup_ic, 4),
+                        'ecc':    round(_xload - _xsup_ic, 4),
+                        'coalesced': abs(_xload - _xsup_ic) < 0.01,
+                    })
+                    jnds_per_new.append(_j)
+                jnds_per = jnds_per_new
+                if not load_nodes:
+                    return None, "No se encontraron columnas para la zapata intra-combinada."
+            else:
+                load_nodes = geom.get('loads', [])
+                if not load_nodes:
+                    return None, "Geometría del sistema no disponible (sin nodos de carga)."
+
+            all_j_flat = []
+            for _js in jnds_per:
+                all_j_flat.extend(_flat(_js) if not intra_comb else [_js])
+
+            if not intra_comb:
+                # Coordenada perpendicular del eje para sistemas inter-zapatas
+                perp_vals = []
+                for _j in all_j_flat:
+                    _c = j2col_map.get(_j)
+                    if _c:
+                        perp_vals.append(_c['y'] if direction == 'X' else _c['x'])
+                beam_perp = round(sum(perp_vals) / len(perp_vals), 5) if perp_vals else 0.0
 
             # ── Registro de nudos 1D (todos sobre el eje de la viga) ─────────
             _pt_map  = {}    # axis_pos → sap_jid
@@ -2024,29 +2134,43 @@ with tab_audit_v:
             unique_sup_jnts  = list(dict.fromkeys(sup_jnt_by_node))
 
             # ── Elementos de viga ─────────────────────────────────────────────
-            # Tramos: conectar posiciones de apoyo únicas y ordenadas
-            sup_axes = sorted(set(round(float(ln['x_sup']), 5) for ln in load_nodes))
             frames_conn = []   # [(jnt_i, jnt_j)]
-            for _i in range(len(sup_axes) - 1):
-                _jA = _get_jnt(sup_axes[_i])
-                _jB = _get_jnt(sup_axes[_i+1])
-                if _jA != _jB:
-                    frames_conn.append((_jA, _jB))
 
-            # Brazos excéntricos: nudo-carga → nudo-apoyo (cuando ecc > 0)
-            _arm_done = set()
-            for _i, ln in enumerate(load_nodes):
-                if not ln.get('coalesced', True) and abs(ln.get('ecc', 0)) > 1e-4:
-                    _jld = load_jnt_by_node[_i]
-                    _jsp = sup_jnt_by_node[_i]
-                    if _jld != _jsp:
-                        _pair = tuple(sorted([_jld, _jsp]))
-                        if _pair not in _arm_done:
-                            frames_conn.append((_jld, _jsp))
-                            _arm_done.add(_pair)
+            if intra_comb:
+                # Viga con voladizos: conectar TODOS los nudos en orden de posición
+                # (nudos de carga + nudo de apoyo en el centroide).
+                # Se conectan tramos consecutivos entre el nudo más a la izquierda
+                # y el más a la derecha, incluyendo el apoyo si está entre ellos.
+                _all_axes_ic = sorted(_pt_map.keys())
+                if len(_all_axes_ic) < 2:
+                    return None, "Zapata intra-combinada con un único punto — no se puede generar viga."
+                for _i in range(len(_all_axes_ic) - 1):
+                    _jA = _get_jnt(_all_axes_ic[_i])
+                    _jB = _get_jnt(_all_axes_ic[_i+1])
+                    if _jA != _jB:
+                        frames_conn.append((_jA, _jB))
+            else:
+                # Sistema inter-zapatas: tramos entre posiciones de apoyo ordenadas
+                sup_axes = sorted(set(round(float(ln['x_sup']), 5) for ln in load_nodes))
+                for _i in range(len(sup_axes) - 1):
+                    _jA = _get_jnt(sup_axes[_i])
+                    _jB = _get_jnt(sup_axes[_i+1])
+                    if _jA != _jB:
+                        frames_conn.append((_jA, _jB))
+
+                # Brazos excéntricos: nudo-carga → nudo-apoyo (cuando ecc > 0)
+                _arm_done = set()
+                for _i, ln in enumerate(load_nodes):
+                    if not ln.get('coalesced', True) and abs(ln.get('ecc', 0)) > 1e-4:
+                        _jld = load_jnt_by_node[_i]
+                        _jsp = sup_jnt_by_node[_i]
+                        if _jld != _jsp:
+                            _pair = tuple(sorted([_jld, _jsp]))
+                            if _pair not in _arm_done:
+                                frames_conn.append((_jld, _jsp))
+                                _arm_done.add(_pair)
 
             if not frames_conn:
-                # Si todos coalesced en un punto, hacer al menos un elemento ficticio
                 all_axes = sorted(_pt_map.keys())
                 if len(all_axes) >= 2:
                     frames_conn.append((_get_jnt(all_axes[0]), _get_jnt(all_axes[-1])))
@@ -2641,12 +2765,19 @@ with tab_export:
 
         _sheet_guide = [
             ("Resumen",
-             "Dimensiones finales de cada zapata y resumen ejecutivo de diseño.",
+             "Dimensiones finales de cada zapata y resumen ejecutivo de diseño. "
+             "Los valores marcados con * corresponden a la combinación LRFD crítica (mayor ratio de punzonamiento).",
              "ID — identificador; Tipo — simple/combined; Esquema — tipo de zapata; "
              "Loc — ubicación (concéntrica, medianera, esquinera); B × L × h — dimensiones (m); "
              "Área (m²); Vol (m³); qmax / qmin — presiones extremas del suelo (kPa); "
              "FSv — factor de seguridad al volcamiento; FSd — factor de seguridad al deslizamiento; "
-             "Pu — carga axial última (kN); P% — ratio punzonamiento (%); V% — ratio corte (%); "
+             "Pu — carga axial última máxima (kN); "
+             "Mux* / Muy* — momentos últimos de la combo crítica (kN·m); "
+             "ex* / ey* — excentricidades = |Muy|/Pu y |Mux|/Pu de la combo crítica (m); "
+             "Vu_x / Vu_y — cortante último 1-vía (viga amplia) por dirección, combo crítica (kN); "
+             "Vx% / Vy% — demanda/capacidad a cortante 1-vía por dirección (%); "
+             "Vu_pun — fuerza última de punzonamiento = Pu·(1 − Ap/A), combo crítica (kN); "
+             "Pun% — ratio de demanda/capacidad a punzonamiento = vu_max/φvc (%); "
              "Asx / Asy — acero requerido por dirección (cm²); Ref X / Ref Y — varilla propuesta; "
              "Estado — resultado del diseño (OK, REVISION, NO_CUMPLE)"),
             ("ASD",
@@ -2664,16 +2795,21 @@ with tab_export:
              "FSv — factor de seguridad al volcamiento; FSd — factor de seguridad al deslizamiento"),
             ("LRFD",
              "Diseño por resistencia última (Load & Resistance Factor Design — ACI 318). "
-             "Una fila por combinación de carga por cada zapata.",
+             "Una fila por combinación de carga, ordenadas de mayor a menor ratio de punzonamiento.",
              "Combo — combinación de carga última; Pu — carga axial última (kN); "
              "Mux / Muy — momentos últimos por dirección (kN·m); "
-             "vu_max — tensión de corte unitaria máxima (kPa); "
-             "φvc — resistencia del concreto a corte reducida por φ (kN); "
-             "P% — relación de demanda / capacidad a punzonamiento (%); "
-             "Vu_x / Vu_y — cortante último por dirección (kN); "
-             "φVn_x / φVn_y — resistencia nominal reducida a corte por dirección (kN); "
-             "Vx% / Vy% — ratios de corte por dirección (%); Vmax% — ratio de corte máximo (%); "
-             "Mu_x / Mu_y — momentos de diseño a flexión (kN·m); "
+             "ex = |Muy|/Pu — excentricidad en X (m); ey = |Mux|/Pu — excentricidad en Y (m); "
+             "── PUNZONAMIENTO (ACI 318 §22.6) ── "
+             "Vu_pun = Pu·(1 − Ap/A) — fuerza última de punzonamiento (kN); "
+             "Ap = área del perímetro crítico bo·d (d/2 desde la cara de columna); "
+             "vu_pun — tensión de corte unitaria combinada = vu_d + γvMu/(J·c) (kPa); "
+             "φvc_pun — resistencia reducida del concreto a punzonamiento (kPa); "
+             "Pun% = vu_pun/φvc_pun × 100 (%); "
+             "── CORTANTE 1-VÍA (viga amplia) ── "
+             "Vu_x / Vu_y — cortante último en sección crítica (a distancia d de cara de columna) por dirección (kN); "
+             "φVn_x / φVn_y — resistencia reducida φ·0.17·√(f'c)·b·d por dirección (kN); "
+             "Vx% / Vy% — ratios de corte por dirección (%); Vcorte% — máximo entre Vx% y Vy% (%); "
+             "Mu_x / Mu_y — momentos de diseño a flexión en sección crítica (kN·m); "
              "As_x / As_y — acero de refuerzo requerido por dirección (cm²)"),
             ("Cantidades",
              "Metrado de materiales de la cimentación (material take-off). "
@@ -2724,7 +2860,11 @@ with tab_export:
         ws['A1'] = "PREDIMENSIONAMIENTO DE CIMENTACIONES"; ws['A1'].font = Font(bold=True, size=14)
         ws['A2'] = f"R={R} | f'c={fc}MPa | qadm: {qadm_1}/{qadm_2}/{qadm_3} kPa"
         headers = ['ID', 'Tipo', 'Esquema', 'Loc', 'B', 'L', 'h', 'Área', 'Vol',
-                   'qmax', 'qmin', 'FSv', 'FSd', 'Pu', 'P%', 'V%', 'Asx', 'Ref X', 'Asy', 'Ref Y', 'Estado']
+                   'qmax', 'qmin', 'FSv', 'FSd',
+                   'Pu (kN)', 'Mux* (kN·m)', 'Muy* (kN·m)', 'ex* (m)', 'ey* (m)',
+                   'Vu_x (kN)', 'Vx%', 'Vu_y (kN)', 'Vy%',
+                   'Vu_pun (kN)', 'Pun%',
+                   'Asx', 'Ref X', 'Asy', 'Ref Y', 'Estado']
         wh(ws, 4, headers)
         for i, f in enumerate(final, 5):
             rx3 = propose_rebar(f['Asx'], f['B'], rec)
@@ -2732,12 +2872,17 @@ with tab_export:
             loc = f.get('classification', {}).get('location', '') if f.get('type') != 'combined' else f.get('scheme', '')
             vol = f['B'] * f['L'] * f['h']
             fsv = f.get('fs_volc_min', 999); fsd = f.get('fs_desl_min', 999)
+            _lc3 = max(f.get('lrfd_audit', [{}]), key=lambda a: a.get('punch_ratio', 0), default={})
             vals = [f['id'], f.get('type', '?'), f.get('scheme', ''), loc[:12],
                     f['B'], f['L'], f['h'], f['A'], round(vol, 3),
                     f['qmax'], f['qmin'],
                     round(fsv, 1) if fsv < 900 else '∞', round(fsd, 1) if fsd < 900 else '∞',
                     f['Pu'],
-                    round(f['pr']*100, 1), round(f['sr']*100, 1),
+                    _lc3.get('Mux', 0), _lc3.get('Muy', 0),
+                    _lc3.get('ex', 0), _lc3.get('ey', 0),
+                    _lc3.get('Vu_x', 0), round(_lc3.get('sr_x', 0)*100, 1),
+                    _lc3.get('Vu_y', 0), round(_lc3.get('sr_y', 0)*100, 1),
+                    _lc3.get('Vu_punch', 0), round(_lc3.get('punch_ratio', 0)*100, 1),
                     f['Asx'], rx3['text'], f['Asy'], ry3['text'], f['st']]
             for c, v in enumerate(vals, 1):
                 cell = ws.cell(row=i, column=c, value=v); cell.border = bd
@@ -2768,6 +2913,20 @@ with tab_export:
                     if c == len(vals):
                         cell.fill = ff_fill if v > 1.05 else (wf if v > 0.85 else okf)
                 row_n += 1
+            # Cargas por columna (solo combinadas)
+            _cal = f.get('col_ads_loads', [])
+            if _cal:
+                _ch = ws2.cell(row=row_n, column=1, value=f"  ↳ Cargas por columna — {f['id']}")
+                _ch.font = Font(italic=True, color='374151'); row_n += 1
+                _cal_h = ['Columna', 'Combo', 'Grupo', 'P (kN)', 'Mx (kN·m)', 'My (kN·m)', 'Vx (kN)', 'Vy (kN)']
+                wh(ws2, row_n, _cal_h); row_n += 1
+                for _a in sorted(_cal, key=lambda x: (x['Columna'], x['P (kN)'])):
+                    _av = [_a['Columna'], _a['Combo'], _a['Grupo'],
+                           _a['P (kN)'], _a['Mx (kN·m)'], _a['My (kN·m)'],
+                           _a['Vx (kN)'], _a['Vy (kN)']]
+                    for c, v in enumerate(_av, 1):
+                        ws2.cell(row=row_n, column=c, value=v).border = bd
+                    row_n += 1
             row_n += 1
 
         # 3. LRFD
@@ -2776,16 +2935,21 @@ with tab_export:
         for f in final:
             ws3.cell(row=row_n, column=1, value=f"═══ {f['id']} — d={f.get('d', 0)}m ═══").font = Font(bold=True)
             row_n += 1
-            lh = ['Combo', 'Pu', 'Mux', 'Muy',
-                'vu_max', 'φvc', 'P%',
-                'Vu_x', 'φVn_x', 'Vx%',
-                'Vu_y', 'φVn_y', 'Vy%',
-                'Vmax%',
-                'Mu_x', 'Mu_y', 'As_x', 'As_y']
+            lh = ['Combo', 'Pu (kN)', 'Mux (kN·m)', 'Muy (kN·m)', 'ex (m)', 'ey (m)',
+                  # ── Punzonamiento ACI 318 §22.6 ──
+                  'Vu_pun (kN)', 'vu_pun (kPa)', 'φvc_pun (kPa)', 'Pun%',
+                  # ── Cortante 1-vía X ──
+                  'Vu_x (kN)', 'φVn_x (kN)', 'Vx%',
+                  # ── Cortante 1-vía Y ──
+                  'Vu_y (kN)', 'φVn_y (kN)', 'Vy%',
+                  'Vcorte%',
+                  'Mu_x (kN·m)', 'Mu_y (kN·m)', 'As_x (cm²)', 'As_y (cm²)']
             wh(ws3, row_n, lh); row_n += 1
-            for a in sorted(f.get('lrfd_audit', []), key=lambda x: x['Pu'], reverse=True):
+            for a in sorted(f.get('lrfd_audit', []), key=lambda x: x.get('punch_ratio', 0), reverse=True):
                 vals = [a['combo'], a['Pu'], a['Mux'], a['Muy'],
-                    a.get('vu_max', 0), a.get('phi_vc', 0), round(a.get('punch_ratio', 0)*100, 1),
+                    a.get('ex', 0), a.get('ey', 0),
+                    a.get('Vu_punch', 0), a.get('vu_max', 0), a.get('phi_vc', 0),
+                    round(a.get('punch_ratio', 0)*100, 1),
                     a.get('Vu_x', 0), a.get('phi_Vn_x', 0), round(a.get('sr_x', 0)*100, 1),
                     a.get('Vu_y', 0), a.get('phi_Vn_y', 0), round(a.get('sr_y', 0)*100, 1),
                     round(a.get('shear_ratio', 0)*100, 1),
@@ -2793,6 +2957,27 @@ with tab_export:
                 for c, v in enumerate(vals, 1):
                     cell = ws3.cell(row=row_n, column=c, value=v); cell.border = bd
                 row_n += 1
+            # Punzonamiento por columna (solo combinadas)
+            _cpa = f.get('col_punch_audit', [])
+            if _cpa:
+                _ph = ws3.cell(row=row_n, column=1,
+                               value=f"  ↳ Punzonamiento por columna — {f['id']}  (ACI 318 §22.6)")
+                _ph.font = Font(italic=True, color='374151'); row_n += 1
+                _cpa_h = ['Columna', 'Combo', 'bx (m)', 'by (m)',
+                           'Pu (kN)', 'Mux (kN·m)', 'Muy (kN·m)', 'ex (m)', 'ey (m)',
+                           'Vu_pun (kN)', 'vu_pun (kPa)', 'φvc_pun (kPa)', 'Pun%']
+                wh(ws3, row_n, _cpa_h); row_n += 1
+                for _a in sorted(_cpa, key=lambda x: (x['Columna'], -x['Pun%'])):
+                    _av = [_a['Columna'], _a['Combo'], _a['bx (m)'], _a['by (m)'],
+                           _a['Pu (kN)'], _a['Mux (kN·m)'], _a['Muy (kN·m)'],
+                           _a['ex (m)'], _a['ey (m)'],
+                           _a['Vu_pun (kN)'], _a['vu_pun (kPa)'], _a['φvc_pun (kPa)'], _a['Pun%']]
+                    for ci, v in enumerate(_av, 1):
+                        _cell = ws3.cell(row=row_n, column=ci, value=v); _cell.border = bd
+                        if ci == len(_av):   # colorear Pun%
+                            if isinstance(v, (int, float)):
+                                _cell.fill = ff_fill if v > 100 else (wf if v > 75 else okf)
+                    row_n += 1
             row_n += 1
 
         # 4. Cantidades

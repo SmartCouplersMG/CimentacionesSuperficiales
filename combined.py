@@ -10,7 +10,7 @@ Funciones:
 import math
 import numpy as np
 from collections import defaultdict
-from isolated import full_structural_design, calc_as
+from isolated import full_structural_design, calc_as, punching_with_moment
 
 
 def check_overlaps(footings, min_gap=0.10):
@@ -333,12 +333,40 @@ def design_combined_footing(grp_indices, footings, group_cols, ads_all, lrfd_all
             Vxt += fd['Vx']; Vyt += fd['Vy']
         lrfd_c[cn] = {'P': Pt, 'Mx': Mxt, 'My': Myt, 'Vx': Vxt, 'Vy': Vyt}
 
+    # ── Eje longitudinal de la zapata combinada (necesario antes de la iteración) ──
+    xs_g = [c['x'] for c in group_cols]; ys_g = [c['y'] for c in group_cols]
+    range_x = max(xs_g) - min(xs_g) if len(xs_g) > 1 else 0
+    range_y = max(ys_g) - min(ys_g) if len(ys_g) > 1 else 0
+    long_axis = 'x' if range_x >= range_y else 'y'
+
     # ── Iterar dimensiones ──
     cbx = max(c['bx'] for c in group_cols); cby = max(c['by'] for c in group_cols)
+
+    # ── Ancho efectivo para cortante 1-vía (dirección longitudinal) ────────────
+    # Para zapatas combinadas el voladizo real en la dirección del eje longitudinal
+    # no es (B - cbx)/2 sino (B - span_entre_caras_exteriores)/2.
+    # Ejemplo: 2 columnas a 3 m con bx=0.4 m:
+    #   cbx_shear = 3.0 + 0.4 = 3.4 m  → cant = (3.5 - 3.4)/2 = 0.05 m ✔
+    #   cbx solo  = 0.4 m             → cant = (3.5 - 0.4)/2 = 1.55 m ✗
+    # En la dirección transversal se mantiene el tamaño real de la columna.
+    if len(group_cols) > 1:
+        _xs = [c['x'] for c in group_cols]; _ys = [c['y'] for c in group_cols]
+        _span_x = (max(_xs) - min(_xs)) + cbx   # distancia entre caras externas en X
+        _span_y = (max(_ys) - min(_ys)) + cby   # distancia entre caras externas en Y
+        if long_axis == 'x':
+            col_shear_bx = _span_x   # longitudinal = X → voladizo en B
+            col_shear_by = cby       # transversal   = Y → voladizo real en L
+        else:
+            col_shear_bx = cbx       # transversal   = X → voladizo real en B
+            col_shear_by = _span_y   # longitudinal = Y → voladizo en L
+    else:
+        col_shear_bx = cbx; col_shear_by = cby
+
     for _iter in range(20):
         r = full_structural_design(
             '+'.join(c['joint'] for c in group_cols),
-            xR_final, yR_final, B_comb, L_comb, h_comb, cbx, cby, ads_c, lrfd_c, params, col_forces_all)
+            xR_final, yR_final, B_comb, L_comb, h_comb, cbx, cby, ads_c, lrfd_c, params, col_forces_all,
+            col_shear_bx=col_shear_bx, col_shear_by=col_shear_by)
         if r['st'] not in ('NO_CUMPLE', 'REVISAR_h'): break
         if r['st'] == 'NO_CUMPLE':
             sc = 1.1
@@ -388,9 +416,12 @@ def design_combined_footing(grp_indices, footings, group_cols, ads_all, lrfd_all
         if _geom_changed:
             if pinned_x: _repin_x()
             if pinned_y: _repin_y()
+            # Recalcular col_shear tras el cambio de B/L (el span real no cambia, pero
+            # por consistencia se pasan los mismos valores calculados arriba)
             r = full_structural_design(
                 '+'.join(c['joint'] for c in group_cols),
-                xR_final, yR_final, B_comb, L_comb, h_comb, cbx, cby, ads_c, lrfd_c, params, col_forces_all)
+                xR_final, yR_final, B_comb, L_comb, h_comb, cbx, cby, ads_c, lrfd_c, params, col_forces_all,
+                col_shear_bx=col_shear_bx, col_shear_by=col_shear_by)
         # all_contained left as-is: if locked prevented expansion, it stays False → shown in UI
 
     # ── Esquema heredado ──
@@ -404,32 +435,47 @@ def design_combined_footing(grp_indices, footings, group_cols, ads_all, lrfd_all
     r['scheme'] = inherited_scheme; r['location'] = {'location': inherited_scheme}
     r['x_footing'] = xR_final; r['y_footing'] = yR_final
 
-    # ── Análisis longitudinal V-M (Bowles) ──
-    xs_g = [c['x'] for c in group_cols]; ys_g = [c['y'] for c in group_cols]
-    range_x = max(xs_g) - min(xs_g) if len(xs_g) > 1 else 0
-    range_y = max(ys_g) - min(ys_g) if len(ys_g) > 1 else 0
-    long_axis = 'x' if range_x >= range_y else 'y'
+    # ── Análisis longitudinal V-M (Bowles) ── (long_axis ya calculado arriba)
+    # d = h - rec - db/2  con db = 12 mm → db/2 = 0.006 m  (McCormac/Bowles)
+    # Se verifica además que V_max ≤ φVc = 0.75·0.17·√(fc/1000)·1000·bt·d
+    # Si falla se incrementa h en 0.05 m y se repite (máx 10 intentos).
 
-    best_long = None; best_Mpos = 0; best_sd = None
-    d_comb = h_comb - params['rec'] - 0.016; d_comb = max(d_comb, 0.10)
-    for cn in lrfd_c.keys():
-        P_cols_vm = []; col_geom_vm = []
-        for c in group_cols:
-            j = c['joint']; fd = lrfd_all.get(j, {}).get(cn, {'P': 0})
-            P_cols_vm.append(abs(fd['P']))
-            col_geom_vm.append({'x': c['x'] if long_axis == 'x' else c['y'],
-                                'bx': c['bx'] if long_axis == 'x' else c['by']})
-        Pu_t = lrfd_c[cn]['P']
-        qu_vm = Pu_t / (B_comb * L_comb) if B_comb * L_comb > 0 else 0
-        if long_axis == 'x':
-            xl = xR_final - B_comb / 2; xr = xR_final + B_comb / 2; bt = L_comb
-        else:
-            xl = yR_final - L_comb / 2; xr = yR_final + L_comb / 2; bt = B_comb
-        la = analyze_combined_longitudinal(xl, xr, bt, col_geom_vm, P_cols_vm, qu_vm, d_comb)
-        if abs(la['M_pos_max']) > best_Mpos:
-            best_Mpos = abs(la['M_pos_max']); best_long = la
+    best_long = None; best_sd = None
+    d_comb = h_comb - params['rec'] - 0.006; d_comb = max(d_comb, 0.10)
+    _fc_c = params['fc']
+    _pvc_long_unit = 0.75 * 0.17 * math.sqrt(_fc_c / 1000) * 1000   # φvc [kN/m²]
+    bt_vm = L_comb if long_axis == 'x' else B_comb                   # ancho transversal [m]
+
+    for _iter_long in range(10):
+        best_long = None; best_Mpos = 0
+        for cn in lrfd_c.keys():
+            P_cols_vm = []; col_geom_vm = []
+            for c in group_cols:
+                j = c['joint']; fd = lrfd_all.get(j, {}).get(cn, {'P': 0})
+                P_cols_vm.append(abs(fd['P']))
+                col_geom_vm.append({'x': c['x'] if long_axis == 'x' else c['y'],
+                                    'bx': c['bx'] if long_axis == 'x' else c['by']})
+            Pu_t = lrfd_c[cn]['P']
+            qu_vm = Pu_t / (B_comb * L_comb) if B_comb * L_comb > 0 else 0
+            if long_axis == 'x':
+                xl = xR_final - B_comb / 2; xr = xR_final + B_comb / 2; bt = L_comb
+            else:
+                xl = yR_final - L_comb / 2; xr = yR_final + L_comb / 2; bt = B_comb
+            la = analyze_combined_longitudinal(xl, xr, bt, col_geom_vm, P_cols_vm, qu_vm, d_comb)
+            if abs(la['M_pos_max']) > best_Mpos:
+                best_Mpos = abs(la['M_pos_max']); best_long = la
+
+        # ── Verificación de cortante longitudinal (viga amplia, ACI) ──
+        if best_long is None:
+            break
+        pVc_long = _pvc_long_unit * bt_vm * d_comb   # capacidad [kN]
+        if best_long['V_max'] <= pVc_long or _iter_long == 9:
+            break
+        # Cortante no cumple → incrementar peralte 5 cm y reintentar
+        h_comb = math.ceil((h_comb + 0.05) * 20) / 20
+        d_comb = h_comb - params['rec'] - 0.006; d_comb = max(d_comb, 0.10)
+
     if best_long:
-        bt_vm = L_comb if long_axis == 'x' else B_comb
         best_sd = compute_steel_diagram(best_long, bt_vm, d_comb, params['fc'], params['fy'])
 
     r['combined_analysis'] = best_long
@@ -450,4 +496,57 @@ def design_combined_footing(grp_indices, footings, group_cols, ads_all, lrfd_all
         'bot_pin': bot_pin, 'top_pin': top_pin,
         'pinned_x': pinned_x, 'pinned_y': pinned_y,
     }
+
+    # ── Auditoría por columna individual ──────────────────────────────────────
+    # Para zapatas combinadas, el punzonamiento se revisa en el perímetro crítico
+    # de CADA columna por separado (ACI 318 §22.6).  El cortante 1-vía es global.
+    _d_used = r.get('d', h_comb - params['rec'] - 0.006)
+    _fc_c   = params['fc']
+
+    col_punch_audit = []   # LRFD — carga + punzonamiento por columna
+    for _c in group_cols:
+        _jc = _c['joint']
+        for _cn, _fd in lrfd_all.get(_jc, {}).items():
+            _Pu_c  = abs(_fd.get('P', 0))
+            _Mxu_c = _fd.get('Mx', 0)
+            _Myu_c = _fd.get('My', 0)
+            _pk = punching_with_moment(_Pu_c, _Mxu_c, _Myu_c,
+                                       B_comb, L_comb, _c['bx'], _c['by'],
+                                       _d_used, _fc_c)
+            _ex_c = round(abs(_Myu_c) / _Pu_c, 4) if _Pu_c > 0 else 0
+            _ey_c = round(abs(_Mxu_c) / _Pu_c, 4) if _Pu_c > 0 else 0
+            col_punch_audit.append({
+                'Columna': f'J{_jc}',
+                'Combo':   _cn,
+                'bx (m)':  _c['bx'],
+                'by (m)':  _c['by'],
+                'Pu (kN)': round(_Pu_c, 2),
+                'Mux (kN·m)': round(_Mxu_c, 2),
+                'Muy (kN·m)': round(_Myu_c, 2),
+                'ex (m)': _ex_c,
+                'ey (m)': _ey_c,
+                'Vu_pun (kN)':   _pk['Vu'],
+                'vu_pun (kPa)':  _pk['vu_max'],
+                'φvc_pun (kPa)': _pk['phi_vc'],
+                'Pun%': round(_pk['ratio'] * 100, 1),
+            })
+
+    col_ads_loads = []     # ADS — carga por columna (para auditoría de presiones)
+    for _c in group_cols:
+        _jc = _c['joint']
+        for _cn, _fd in ads_all.get(_jc, {}).items():
+            col_ads_loads.append({
+                'Columna': f'J{_jc}',
+                'Combo':   _cn,
+                'Grupo':   _fd.get('group', 'q1'),
+                'P (kN)':  round(abs(_fd.get('P', 0)), 2),
+                'Mx (kN·m)': round(_fd.get('Mx', 0), 2),
+                'My (kN·m)': round(_fd.get('My', 0), 2),
+                'Vx (kN)':   round(_fd.get('Vx', 0), 2),
+                'Vy (kN)':   round(_fd.get('Vy', 0), 2),
+            })
+
+    r['col_punch_audit'] = col_punch_audit
+    r['col_ads_loads']   = col_ads_loads
+
     return r
